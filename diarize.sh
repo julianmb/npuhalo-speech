@@ -31,6 +31,8 @@ if [ $# -eq 0 ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
     echo "  --output, -o <file>      Save transcript to destination file (single file)"
     echo "  --output-dir <dir>       Save transcripts to directory (batch mode)"
     echo "  --num-speakers <N>       Exact number of speakers if known"
+    echo "  --min-speakers <N>       Minimum number of speakers (if exact count unknown)"
+    echo "  --max-speakers <N>       Maximum number of speakers (if exact count unknown)"
     echo "  --language <lang>        Language code (e.g., 'en', 'es', 'zh', 'fr')"
     echo "  --hf-token <token>       Hugging Face access token for pyannote"
     echo ""
@@ -57,7 +59,10 @@ if command -v lemonade &> /dev/null; then
     if ! curl -s "http://127.0.0.1:${LEMONADE_PORT}/health" &> /dev/null; then
         echo "[!] Lemonade server not responding on port ${LEMONADE_PORT}. Starting lemond..."
         lemonade run &> /dev/null &
-        sleep 3
+        for _ in $(seq 1 15); do
+            curl -s "http://127.0.0.1:${LEMONADE_PORT}/health" &> /dev/null && break
+            sleep 1
+        done
     fi
     LOADED_MODELS=$(lemonade status 2>/dev/null || true)
     if ! echo "$LOADED_MODELS" | grep -q "whisper-v3-turbo-FLM"; then

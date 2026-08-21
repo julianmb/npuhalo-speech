@@ -15,8 +15,9 @@ import json
 import time
 import argparse
 import tempfile
+import threading
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional
 
 import requests
 import numpy as np
@@ -25,6 +26,11 @@ import torch
 
 # Global cached local fallback model
 _LOCAL_WHISPER_MODEL = None
+_LOCAL_WHISPER_LOCK = threading.Lock()
+
+# Cached NPU availability (avoids a health-check round trip per segment)
+_NPU_STATUS = {"url": None, "available": False, "checked_at": 0.0}
+_NPU_CACHE_TTL = 30.0
 
 
 def color(text: str, code: str) -> str: return f"\033[{code}m{text}\033[0m"
@@ -78,12 +84,21 @@ def resolve_torch_device(requested_device: str = "cpu") -> str:
 
 
 def check_npu_available(lemonade_url: str = "http://127.0.0.1:13305") -> bool:
-    """Verify if Lemonade NPU daemon is reachable and has Whisper loaded."""
+    """Verify if Lemonade NPU daemon is reachable (cached for _NPU_CACHE_TTL seconds)."""
+    now = time.time()
+    if (
+        _NPU_STATUS["url"] == lemonade_url
+        and now - _NPU_STATUS["checked_at"] < _NPU_CACHE_TTL
+    ):
+        return _NPU_STATUS["available"]
+    available = False
     try:
         res = requests.get(f"{lemonade_url}/health", timeout=1.5)
-        return res.status_code == 200
+        available = res.status_code == 200
     except Exception:
-        return False
+        available = False
+    _NPU_STATUS.update({"url": lemonade_url, "available": available, "checked_at": now})
+    return available
 
 
 def ensure_npu_whisper(lemonade_url: str = "http://127.0.0.1:13305") -> bool:
@@ -91,14 +106,16 @@ def ensure_npu_whisper(lemonade_url: str = "http://127.0.0.1:13305") -> bool:
 
 
 def get_local_whisper_model(device: str = "cpu", model_size: str = "turbo"):
-    """Lazy load faster-whisper on CPU or CUDA."""
+    """Lazy load faster-whisper on CPU or CUDA (thread-safe)."""
     global _LOCAL_WHISPER_MODEL
     if _LOCAL_WHISPER_MODEL is None:
-        from faster_whisper import WhisperModel
-        compute_type = "float16" if (device == "cuda" and torch.cuda.is_available()) else "int8"
-        target_dev = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
-        print(cyan(f"[*] Loading local Faster-Whisper ({model_size}) on {target_dev.upper()} ({compute_type})..."))
-        _LOCAL_WHISPER_MODEL = WhisperModel(model_size, device=target_dev, compute_type=compute_type)
+        with _LOCAL_WHISPER_LOCK:
+            if _LOCAL_WHISPER_MODEL is None:
+                from faster_whisper import WhisperModel
+                compute_type = "float16" if (device == "cuda" and torch.cuda.is_available()) else "int8"
+                target_dev = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+                print(cyan(f"[*] Loading local Faster-Whisper ({model_size}) on {target_dev.upper()} ({compute_type})..."))
+                _LOCAL_WHISPER_MODEL = WhisperModel(model_size, device=target_dev, compute_type=compute_type)
     return _LOCAL_WHISPER_MODEL
 
 
@@ -109,7 +126,7 @@ def transcribe_audio_segment(
     language: Optional[str] = None,
     prompt: Optional[str] = None,
     fallback_device: str = "cpu"
-) -> (str, str):
+) -> Tuple[str, str]:
     """
     Transcribe audio segment with prompt conditioning.
     Attempts NPU first via Lemonade; falls back to local CPU/GPU Faster-Whisper if NPU is offline.
@@ -277,6 +294,8 @@ def process_pipeline(
     device: str = "cpu",
     hf_token: Optional[str] = None,
     num_speakers: Optional[int] = None,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
     lemonade_url: str = "http://127.0.0.1:13305",
     language: Optional[str] = None,
     padding_sec: float = 0.15
@@ -316,11 +335,16 @@ def process_pipeline(
         str(audio_file),
         hf_token=hf_token,
         device=active_device,
-        num_speakers=num_speakers
+        num_speakers=num_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers
     )
 
     if not speaker_turns:
         speaker_turns = [{"start": 0.0, "end": duration, "speaker": "SPEAKER_00"}]
+
+    # Ensure chronological order regardless of diarizer output ordering
+    speaker_turns.sort(key=lambda t: (t["start"], t["end"]))
 
     print(f"[+] Found {len(speaker_turns)} speaker speech turns.")
 
@@ -450,6 +474,8 @@ def main():
     parser.add_argument("--device", "-d", choices=["cpu", "cuda", "rocm", "gpu", "auto"], default="cpu",
                         help="Execution device for speaker diarization / fallback ASR (default: cpu)")
     parser.add_argument("--num-speakers", type=int, default=None, help="Exact number of speakers if known")
+    parser.add_argument("--min-speakers", type=int, default=None, help="Minimum number of speakers (if exact count unknown)")
+    parser.add_argument("--max-speakers", type=int, default=None, help="Maximum number of speakers (if exact count unknown)")
     parser.add_argument("--language", type=str, default=None, help="Language code (e.g. 'en', 'es', 'zh')")
     parser.add_argument("--format", choices=["text", "json", "srt", "vtt"], default="text", help="Output format")
     parser.add_argument("--output", "-o", type=str, default=None, help="Save transcript to output file (single file mode)")
@@ -489,6 +515,8 @@ def main():
                     device=args.device,
                     hf_token=args.hf_token,
                     num_speakers=args.num_speakers,
+                    min_speakers=args.min_speakers,
+                    max_speakers=args.max_speakers,
                     lemonade_url=args.lemonade_url,
                     language=args.language
                 )
@@ -507,6 +535,8 @@ def main():
                 device=args.device,
                 hf_token=args.hf_token,
                 num_speakers=args.num_speakers,
+                min_speakers=args.min_speakers,
+                max_speakers=args.max_speakers,
                 lemonade_url=args.lemonade_url,
                 language=args.language
             )

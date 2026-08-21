@@ -11,26 +11,24 @@ Features:
 """
 
 import os
-import sys
 import secrets
 import tempfile
 import argparse
+import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException, Depends, status
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 import uvicorn
-import soundfile as sf
-import numpy as np
 
 # Import pipeline logic
 from transcribe_diarize import (
     process_pipeline,
     output_transcript,
-    transcribe_audio_npu,
+    transcribe_audio_segment,
     ensure_npu_whisper,
     librosa_or_sf_load,
     format_timestamp,
@@ -47,7 +45,6 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -59,6 +56,17 @@ SERVER_CONFIG = {
     "default_device": "cpu",
     "hf_token": None
 }
+
+# Serialize heavy pipeline work to protect the NPU/GPU from concurrent thrashing
+PIPELINE_SEMAPHORE = threading.Semaphore(1)
+
+
+def run_pipeline_blocking(fn, *args, **kwargs):
+    """Run a pipeline function in the threadpool, gated by PIPELINE_SEMAPHORE."""
+    def _worker():
+        with PIPELINE_SEMAPHORE:
+            return fn(*args, **kwargs)
+    return run_in_threadpool(_worker)
 
 
 def verify_api_key(authorization: Optional[str] = Header(None)):
@@ -74,7 +82,7 @@ def verify_api_key(authorization: Optional[str] = Header(None)):
         )
 
     scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or token.strip() != expected_key:
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token.strip(), expected_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": {"message": "Invalid API key provided.", "type": "invalid_request_error", "code": "invalid_api_key"}}
@@ -736,6 +744,8 @@ async def create_transcription(
     temperature: Optional[float] = Form(0.0),
     diarize: bool = Form(True),
     num_speakers: Optional[int] = Form(None),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None),
     device: Optional[str] = Form(None),
     _: bool = Depends(verify_api_key)
 ):
@@ -752,12 +762,14 @@ async def create_transcription(
 
     try:
         if diarize:
-            results = await run_in_threadpool(
+            results = await run_pipeline_blocking(
                 process_pipeline,
                 audio_path=tmp_path,
                 device=active_device,
                 hf_token=SERVER_CONFIG["hf_token"],
                 num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
                 lemonade_url=SERVER_CONFIG["lemonade_url"],
                 language=language,
                 padding_sec=0.15
@@ -812,11 +824,13 @@ async def create_transcription(
                 })
 
         else:
-            text = await run_in_threadpool(
-                transcribe_audio_npu,
+            text, _ = await run_pipeline_blocking(
+                transcribe_audio_segment,
                 audio_path=tmp_path,
                 lemonade_url=SERVER_CONFIG["lemonade_url"],
-                language=language
+                language=language,
+                prompt=prompt,
+                fallback_device=active_device
             )
 
             if response_format == "text":

@@ -21,6 +21,8 @@ if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
     echo "  --api-key, -k <key>    Bearer API key for authentication"
     echo "  --no-auth              Disable API key authentication"
     echo "  --device, -d <dev>     Diarization device: cpu (default), rocm, cuda, auto"
+    echo "  --lemonade-url <url>   Lemonade NPU API URL (default: http://127.0.0.1:13305)"
+    echo "  --hf-token <token>     Hugging Face token for gated pyannote model"
     echo ""
     echo "Examples:"
     echo "  ./server.sh"
@@ -44,7 +46,10 @@ if command -v lemonade &> /dev/null; then
     if ! curl -s "http://127.0.0.1:${LEMONADE_PORT}/health" &> /dev/null; then
         echo "[!] Lemonade server not responding on port ${LEMONADE_PORT}. Starting lemond..."
         lemonade run &> /dev/null &
-        sleep 3
+        for _ in $(seq 1 15); do
+            curl -s "http://127.0.0.1:${LEMONADE_PORT}/health" &> /dev/null && break
+            sleep 1
+        done
     fi
     LOADED_MODELS=$(lemonade status 2>/dev/null || true)
     if ! echo "$LOADED_MODELS" | grep -q "whisper-v3-turbo-FLM"; then
