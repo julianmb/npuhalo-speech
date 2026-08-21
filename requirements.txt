@@ -1,0 +1,18 @@
+# Speech Diarization & ASR Pipeline (CPU/GPU Diarization + NPU/CPU Whisper)
+torch>=2.2.0
+torchaudio>=2.2.0
+pyannote.audio>=3.1.0
+faster-whisper>=1.0.0
+av>=11.0.0
+soundfile>=0.12.1
+librosa>=0.10.0
+silero-vad>=5.0.0
+scikit-learn>=1.4.0
+rich>=13.7.0
+huggingface_hub>=0.23.0
+
+# OpenAI-Compatible API Server & Web UI
+fastapi>=0.110.0
+uvicorn>=0.28.0
+python-multipart>=0.0.9
+requests>=2.31.0

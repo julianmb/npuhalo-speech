@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Audio / outputs
+transcripts/
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# HF cache / models
+.hf_cache/
+
+# OS
+.DS_Store
+Thumbs.db
