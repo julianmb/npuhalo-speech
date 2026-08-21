@@ -25,6 +25,10 @@ cd npuhalo-speech
 # GPU diarization, SRT subtitles
 ./diarize.sh meeting.wav --device rocm --format srt -o meeting.srt
 
+# Hint the speaker count when you know it
+./diarize.sh meeting.wav --num-speakers 2          # exact
+./diarize.sh meeting.wav --min-speakers 2 --max-speakers 4  # range
+
 # Batch a folder
 ./diarize.sh ./recordings/ --output-dir ./transcripts/ --format json
 ```
@@ -47,6 +51,18 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -H "Authorization: Bearer my-secret" \
   -F file=@meeting.wav -F model=whisper-1 -F diarize=true
 ```
+
+Extra form fields beyond the OpenAI spec: `diarize` (bool, default `true`), `num_speakers`, `min_speakers`, `max_speakers`, `device` (`cpu`/`rocm`/`cuda`/`auto`). Response formats: `json`, `verbose_json`, `text`, `srt`, `vtt`.
+
+## Development
+
+```bash
+bash -n diarize.sh server.sh          # validate launchers
+python3 -m py_compile scripts/*.py    # syntax-check sources
+python3 -m unittest discover -s tests # unit tests (no torch/GPU needed)
+```
+
+CI runs the same checks on every push and PR (see `.github/workflows/ci.yml`).
 
 ## Hardware
 

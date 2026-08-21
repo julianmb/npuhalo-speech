@@ -22,7 +22,6 @@ from typing import List, Dict, Tuple, Any, Optional
 import requests
 import numpy as np
 import soundfile as sf
-import torch
 
 # Global cached local fallback model
 _LOCAL_WHISPER_MODEL = None
@@ -72,6 +71,7 @@ def resolve_torch_device(requested_device: str = "cpu") -> str:
     """Validate requested device and fall back gracefully if unavailable."""
     req = requested_device.lower().strip()
     if req in ("cuda", "rocm", "gpu", "auto"):
+        import torch
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "ROCm/CUDA GPU"
             print(green(f"  • Diarization Acceleration: GPU detected ({gpu_name})"))
@@ -84,7 +84,11 @@ def resolve_torch_device(requested_device: str = "cpu") -> str:
 
 
 def check_npu_available(lemonade_url: str = "http://127.0.0.1:13305") -> bool:
-    """Verify if Lemonade NPU daemon is reachable (cached for _NPU_CACHE_TTL seconds)."""
+    """Verify if Lemonade NPU daemon is reachable (cached for _NPU_CACHE_TTL seconds).
+
+    Prefers the API health endpoint (/api/v1/health); falls back to the legacy
+    /health path for older Lemonade versions.
+    """
     now = time.time()
     if (
         _NPU_STATUS["url"] == lemonade_url
@@ -93,10 +97,19 @@ def check_npu_available(lemonade_url: str = "http://127.0.0.1:13305") -> bool:
         return _NPU_STATUS["available"]
     available = False
     try:
-        res = requests.get(f"{lemonade_url}/health", timeout=1.5)
+        res = requests.get(f"{lemonade_url}/api/v1/health", timeout=1.5)
         available = res.status_code == 200
     except Exception:
         available = False
+    if not available:
+        try:
+            res = requests.get(f"{lemonade_url}/health", timeout=1.5)
+            available = (
+                res.status_code == 200
+                and "text/html" not in res.headers.get("content-type", "")
+            )
+        except Exception:
+            available = False
     _NPU_STATUS.update({"url": lemonade_url, "available": available, "checked_at": now})
     return available
 
@@ -111,6 +124,7 @@ def get_local_whisper_model(device: str = "cpu", model_size: str = "turbo"):
     if _LOCAL_WHISPER_MODEL is None:
         with _LOCAL_WHISPER_LOCK:
             if _LOCAL_WHISPER_MODEL is None:
+                import torch
                 from faster_whisper import WhisperModel
                 compute_type = "float16" if (device == "cuda" and torch.cuda.is_available()) else "int8"
                 target_dev = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
@@ -180,6 +194,7 @@ def run_pyannote_diarization(
     Run pyannote/speaker-diarization-community-1 on CPU or GPU.
     """
     from pyannote.audio import Pipeline
+    import torch
 
     token = get_hf_token(hf_token)
     model_id = "pyannote/speaker-diarization-community-1"
