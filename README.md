@@ -9,9 +9,22 @@ Heterogeneous speech pipeline for **AMD Strix Halo (Ryzen AI Max+ 395)**: **Whis
 Part of the **[npuhalo](https://github.com/julianmb/npuhalo)** research family — this repo is the standalone, installable product for the speech work.
 
 ## What it does
-- **Transcription:** Whisper-v3-turbo via Lemonade on `/dev/accel/accel0`, auto-fallback to Faster-Whisper on CPU/GPU.
+- **Transcription:** Whisper-v3-turbo via Lemonade on `/dev/accel/accel0`, auto-fallback to Faster-Whisper on CPU/GPU. Selectable engine: Auto / NPU-only / CPU / GPU.
 - **Diarization:** `pyannote/speaker-diarization-community-1` on CPU (default) or ROCm/CUDA, with a librosa + KMeans fallback.
+- **Formats:** WAV, MP3, M4A/AAC (via PyAV), FLAC, OGG/WebM — no ffmpeg install needed.
 - **Features:** 150ms acoustic boundary padding, rolling prompt context, batch/directory mode, speaker-attributed output (Text / JSON / SRT / VTT).
+- **Web Studio:** login-gated UI with live progress stepper (upload → diarize → transcribe), per-turn NPU/CPU backend chips, talk-time breakdown, playback speed + keyboard review controls, search with match navigation, transcript history, and connection-drop recovery.
+
+## What's new in v1.2.0
+- Transcription Engine selector (`asr_backend`: `auto`/`npu`/`cpu`/`gpu`) across CLI, API, and Web Studio
+- Live job progress: `/v1/progress/{job_id}` polling endpoint + progress stepper in the UI
+- Compressed audio support (M4A/AAC/WebM) via PyAV — no system ffmpeg required
+- Full-screen auth gate (API key validated once per device, stored locally)
+- Review workflow: playback speed 0.75×–2×, keyboard shortcuts (`Space`, `←/→`, `J/K/L`), follow-playback auto-scroll
+- Per-speaker talk-time percentages in the results summary
+- Inline search: dims non-matching turns, match counter, Enter/Shift+Enter navigation
+- Resilience: in-flight jobs recover after client network drops; retry button on failures; 500 MB upload guard
+- App-style viewport-fit desktop layout
 
 ## Quick start (Linux)
 

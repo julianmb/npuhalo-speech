@@ -39,7 +39,7 @@ from transcribe_diarize import (
 app = FastAPI(
     title="Strix Halo Speech & Diarization Server",
     description="OpenAI-compatible Audio API accelerated on AMD XDNA 2 NPU and Zen 5 CPU/GPU",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # Enable CORS for external client applications
@@ -211,6 +211,19 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 <!-- Audio Player Preview -->
                 <div id="audioPlayerContainer" class="hidden">
                     <audio id="audioPreview" controls class="w-full h-10 rounded-lg outline-none"></audio>
+                    <div class="flex items-center justify-between mt-2">
+                        <div id="speedGroup" class="flex items-center gap-1" role="group" aria-label="Playback speed">
+                            <button data-speed="0.75" class="speedBtn text-[10px] font-mono px-2 py-0.5 rounded border border-slate-700 text-slate-400 hover:text-slate-200 transition">0.75×</button>
+                            <button data-speed="1" class="speedBtn text-[10px] font-mono px-2 py-0.5 rounded border border-indigo-500 bg-indigo-600/20 text-indigo-300 transition">1×</button>
+                            <button data-speed="1.25" class="speedBtn text-[10px] font-mono px-2 py-0.5 rounded border border-slate-700 text-slate-400 hover:text-slate-200 transition">1.25×</button>
+                            <button data-speed="1.5" class="speedBtn text-[10px] font-mono px-2 py-0.5 rounded border border-slate-700 text-slate-400 hover:text-slate-200 transition">1.5×</button>
+                            <button data-speed="2" class="speedBtn text-[10px] font-mono px-2 py-0.5 rounded border border-slate-700 text-slate-400 hover:text-slate-200 transition">2×</button>
+                        </div>
+                        <label class="flex items-center gap-1.5 text-[10px] text-slate-400 cursor-pointer select-none hover:text-slate-200">
+                            <input type="checkbox" id="followPlayback" checked class="accent-indigo-500 w-3 h-3">
+                            Follow playback
+                        </label>
+                    </div>
                 </div>
             </div>
 
@@ -407,7 +420,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 </div>
 
                 <!-- Results Summary -->
-                <div id="summaryStrip" class="hidden shrink-0 grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+                <div id="summaryStrip" class="hidden shrink-0 grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4">
                     <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5">
                         <p class="text-[9px] uppercase tracking-wider text-slate-500">Speakers</p>
                         <p id="statSpeakers" class="text-lg font-bold text-indigo-400 leading-tight">–</p>
@@ -423,6 +436,11 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5">
                         <p class="text-[9px] uppercase tracking-wider text-slate-500">Avg Latency</p>
                         <p id="statLatency" class="text-lg font-bold text-emerald-400 leading-tight">–</p>
+                    </div>
+                    <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5 col-span-2 sm:col-span-1">
+                        <p class="text-[9px] uppercase tracking-wider text-slate-500">Talk Time</p>
+                        <div id="statTalkTime" class="hidden mt-0.5 space-y-0.5"></div>
+                        <p id="statTalkTimeEmpty" class="text-lg font-bold text-slate-200 leading-tight">–</p>
                     </div>
                 </div>
 
@@ -523,6 +541,9 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         const statTurns = document.getElementById('statTurns');
         const statDuration = document.getElementById('statDuration');
         const statLatency = document.getElementById('statLatency');
+        const statTalkTime = document.getElementById('statTalkTime');
+        const statTalkTimeEmpty = document.getElementById('statTalkTimeEmpty');
+        const followPlayback = document.getElementById('followPlayback');
         const recentList = document.getElementById('recentList');
         const recentItems = document.getElementById('recentItems');
         const clearHistoryBtn = document.getElementById('clearHistoryBtn');
@@ -731,6 +752,10 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 recTimer.classList.add('hidden');
             } else {
                 // Start recording
+                if (!window.isSecureContext) {
+                    showToast('Microphone requires a secure connection. Open the studio via http://localhost:' + location.port + ' on this machine, or serve it over HTTPS.', 'error');
+                    return;
+                }
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                     audioChunks = [];
@@ -1154,6 +1179,40 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 : Math.round(duration) + 's';
             statLatency.textContent = avg !== null ? avg + 'ms' : '–';
 
+            // Per-speaker talk time (% of total speech)
+            const talkBy = {};
+            segs.forEach(s => {
+                const d = Math.max(0, (s.end || 0) - (s.start || 0));
+                talkBy[s.speaker || 'SPEAKER_00'] = (talkBy[s.speaker || 'SPEAKER_00'] || 0) + d;
+            });
+            const totalTalk = Object.values(talkBy).reduce((a, b) => a + b, 0);
+            if (totalTalk > 0 && speakers <= 4) {
+                const ranked = Object.entries(talkBy).sort((a, b) => b[1] - a[1]);
+                statTalkTime.innerHTML = '';
+                const colorMap = { '0': '#3b82f6', '1': '#10b981', '2': '#8b5cf6', '3': '#f59e0b', '4': '#ec4899' };
+                ranked.forEach(([spk, secs]) => {
+                    const pct = Math.round(secs / totalTalk * 100);
+                    const name = escapeHtml(getDisplayName(spk));
+                    const num = parseInt((spk || '').replace(/\D/g, '') || '0') % 5;
+                    const row = document.createElement('div');
+                    row.className = 'flex items-center gap-1';
+                    row.innerHTML = `
+                        <span class="w-1.5 h-1.5 rounded-full shrink-0" style="background:${colorMap[String(num)] || '#64748b'}"></span>
+                        <span class="text-[9px] text-slate-400 truncate flex-1" title="${name}">${name}</span>
+                        <span class="text-[9px] font-mono text-slate-300">${pct}%</span>`;
+                    row.querySelector('span.truncate').onclick = () => renameSpeaker(spk);
+                    statTalkTime.appendChild(row);
+                });
+                statTalkTime.classList.remove('hidden');
+                statTalkTimeEmpty.classList.add('hidden');
+            } else {
+                statTalkTimeEmpty.textContent = duration >= 60
+                    ? Math.floor(duration / 60) + 'm'
+                    : Math.round(duration) + 's';
+                statTalkTimeEmpty.classList.remove('hidden');
+                statTalkTime.classList.add('hidden');
+            }
+
             summaryStrip.classList.remove('hidden');
         }
 
@@ -1372,7 +1431,40 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 if (activeSegCard) activeSegCard.classList.remove('seg-active');
                 activeSegCard = card;
                 card.classList.add('seg-active');
-                card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+                if (!followPlayback || followPlayback.checked) {
+                    card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+                }
+            }
+        });
+
+        // ---------- Playback speed ----------
+        function setSpeed(btn) {
+            audioPreview.playbackRate = parseFloat(btn.dataset.speed);
+            document.querySelectorAll('.speedBtn').forEach(b => {
+                const on = b === btn;
+                b.classList.toggle('border-indigo-500', on);
+                b.classList.toggle('bg-indigo-600/20', on);
+                b.classList.toggle('text-indigo-300', on);
+                b.classList.toggle('border-slate-700', !on);
+                b.classList.toggle('text-slate-400', !on);
+            });
+        }
+        document.querySelectorAll('.speedBtn').forEach(b => b.addEventListener('click', () => setSpeed(b)));
+
+        // ---------- Keyboard shortcuts (review workflow) ----------
+        document.addEventListener('keydown', (e) => {
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+            if (renameModal && !renameModal.classList.contains('hidden')) return;
+            switch (e.key) {
+                case ' ': // play/pause
+                    e.preventDefault();
+                    if (audioPreview.src) audioPreview.paused ? audioPreview.play() : audioPreview.pause();
+                    break;
+                case 'ArrowLeft': audioPreview.currentTime = Math.max(0, audioPreview.currentTime - 5); break;
+                case 'ArrowRight': audioPreview.currentTime = Math.min(audioPreview.duration || 0, audioPreview.currentTime + 5); break;
+                case 'j': audioPreview.currentTime = Math.max(0, audioPreview.currentTime - 10); break;
+                case 'k': audioPreview.pause(); break;
+                case 'l': audioPreview.play(); break;
             }
         });
 
