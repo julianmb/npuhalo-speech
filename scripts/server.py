@@ -552,7 +552,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 info: 'bg-slate-900/90 border-slate-600/50 text-slate-200'
             };
             const icons = { error: 'fa-circle-exclamation', success: 'fa-circle-check', info: 'fa-circle-info' };
-            toast.className = `flex items-start gap-2 text-xs px-4 py-3 rounded-xl border shadow-xl backdrop-blur ${styles[type] || styles.info} animate-[toast-in_.2s_ease-out]`;
+            toast.className = `flex items-start gap-2 text-xs px-4 py-3 rounded-xl border shadow-xl backdrop-blur max-w-full ${styles[type] || styles.info} animate-[toast-in_.2s_ease-out]`;
             toast.innerHTML = `<i class="fa-solid ${icons[type] || icons.info} mt-0.5"></i><span class="leading-relaxed">${escapeHtml(message)}</span>`;
             toastContainer.appendChild(toast);
             setTimeout(() => {
@@ -1238,20 +1238,20 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     card.dataset.start = seg.start;
                     card.dataset.end = seg.end;
                     card.innerHTML = `
-                        <div class="flex items-center justify-between mb-1">
-                            <div class="flex items-center gap-2">
+                        <div class="flex items-center justify-between mb-1 flex-wrap gap-y-1 gap-x-2">
+                            <div class="flex items-center gap-2 flex-wrap min-w-0">
                                 <button onclick="renameSpeaker('${escapeHtml(seg.speaker)}')" title="Click to Rename Speaker" class="text-xs font-semibold uppercase tracking-wider ${textColor} hover:underline flex items-center gap-1.5 cursor-pointer">
                                     <span>${escapeHtml(displayName)}</span>
                                     <i class="fa-solid fa-pen text-[9px] opacity-60"></i>
                                 </button>
-                                <button onclick="seekAudio(${Number(seg.start) || 0})" class="text-[11px] font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 cursor-pointer bg-slate-800/60 px-1.5 py-0.5 rounded">
+                                <button onclick="seekAudio(${Number(seg.start) || 0})" class="text-[11px] font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 cursor-pointer bg-slate-800/60 px-1.5 py-0.5 rounded whitespace-nowrap">
                                     <i class="fa-solid fa-play text-[9px]"></i> ${formatTime(seg.start)} - ${formatTime(seg.end)}
                                 </button>
-                                ${seg.backend ? `<span class="text-[9px] font-mono px-1.5 py-0.5 rounded border ${String(seg.backend).includes('NPU') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-slate-800 text-slate-400 border-slate-700'}">${escapeHtml(seg.backend)}</span>` : ''}
+                                ${seg.backend ? `<span class="text-[9px] font-mono px-1.5 py-0.5 rounded border whitespace-nowrap ${String(seg.backend).includes('NPU') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-slate-800 text-slate-400 border-slate-700'}">${escapeHtml(seg.backend)}</span>` : ''}
                             </div>
-                            ${seg.npu_latency_ms ? `<span class="text-[10px] text-slate-500">${seg.npu_latency_ms}ms NPU</span>` : ''}
+                            ${seg.npu_latency_ms ? `<span class="text-[10px] text-slate-500 whitespace-nowrap">${seg.npu_latency_ms}ms</span>` : ''}
                         </div>
-                        <p class="text-xs text-slate-200 leading-relaxed">${highlightedText}</p>
+                        <p class="text-xs text-slate-200 leading-relaxed break-words">${highlightedText}</p>
                     `;
                     transcriptFeed.appendChild(card);
                 });
