@@ -130,7 +130,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         .seg-active { box-shadow: inset 0 0 0 1px rgb(99 102 241 / 0.6); }
     </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans antialiased">
+<body class="bg-slate-950 text-slate-100 min-h-screen lg:h-screen lg:overflow-hidden flex flex-col font-sans antialiased">
 
     <!-- Header -->
     <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-50">
@@ -164,10 +164,10 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     </header>
 
     <!-- Main Container -->
-    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-        
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8 lg:min-h-0 lg:overflow-hidden">
+
         <!-- Left Column: Upload, Mic & Settings (5 cols) -->
-        <div class="lg:col-span-5 space-y-6">
+        <div class="lg:col-span-5 space-y-6 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
             
             <!-- Audio Input Box -->
             <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-6 shadow-xl backdrop-blur space-y-4">
@@ -275,10 +275,10 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         </div>
 
         <!-- Right Column: Results, Search, Speaker Renaming & Transcript (7 cols) -->
-        <div class="lg:col-span-7 flex flex-col space-y-4">
-            
-            <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-6 shadow-xl flex-1 flex flex-col">
-                <div class="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-800 mb-4 gap-3">
+        <div class="lg:col-span-7 flex flex-col space-y-4 lg:min-h-0">
+
+            <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-6 shadow-xl flex-1 flex flex-col lg:min-h-0">
+                <div class="shrink-0 flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-800 mb-4 gap-3">
                     <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
                         <i class="fa-solid fa-align-left text-indigo-400"></i> Speaker-Attributed Transcript
                     </h2>
@@ -304,7 +304,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 </div>
 
                 <!-- Search and Filter Bar (Shown when results exist) -->
-                <div id="filterBar" class="hidden flex flex-col sm:flex-row items-stretch sm:items-center gap-3 mb-4">
+                <div id="filterBar" class="hidden shrink-0 flex flex-col sm:flex-row items-stretch sm:items-center gap-3 mb-4">
                     <div class="relative flex-1">
                         <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-500 text-xs"></i>
                         <input type="text" id="searchInput" placeholder="Search transcript text..."
@@ -389,7 +389,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 </div>
 
                 <!-- Results Summary -->
-                <div id="summaryStrip" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+                <div id="summaryStrip" class="hidden shrink-0 grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
                     <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5">
                         <p class="text-[9px] uppercase tracking-wider text-slate-500">Speakers</p>
                         <p id="statSpeakers" class="text-lg font-bold text-indigo-400 leading-tight">–</p>
@@ -409,7 +409,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 </div>
 
                 <!-- Transcript Output Container -->
-                <div id="transcriptFeed" class="hidden space-y-3 max-h-[600px] overflow-y-auto pr-2">
+                <div id="transcriptFeed" class="hidden space-y-3 max-h-[600px] lg:max-h-none lg:flex-1 lg:min-h-0 overflow-y-auto pr-2">
                     <!-- Dynamic Turns Appended Here -->
                 </div>
 
