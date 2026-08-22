@@ -130,6 +130,61 @@ class TestLibrosaOrSfLoad(unittest.TestCase):
             self.assertEqual(sr, 16000)
             self.assertEqual(y.ndim, 1)
 
+    def test_resamples_non_16k_wav(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tone44k.wav"
+            sf.write(str(path), (0.1 * np.sin(2 * np.pi * 440 * np.arange(8820) / 44100)).astype("float32"), 44100)
+            y, sr = td.librosa_or_sf_load(str(path))
+            self.assertEqual(sr, 16000)
+            self.assertGreater(len(y), 2000)
+
+
+class TestAvLoadM4a(unittest.TestCase):
+    """PyAV fallback must decode compressed formats (m4a/aac) without ffmpeg CLI."""
+
+    def make_m4a(self, path):
+        import av
+        import numpy as np
+        container = av.open(str(path), mode="w")
+        stream = container.add_stream("aac", rate=16000)
+        stream.layout = "mono"
+        t = np.linspace(0, 2, 32000, endpoint=False)
+        samples = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        frame = av.AudioFrame.from_ndarray(samples[np.newaxis, :], format="fltp", layout="mono")
+        frame.sample_rate = 16000
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+        container.close()
+
+    def test_av_load_decodes_m4a(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tone.m4a"
+            self.make_m4a(path)
+            y, sr = td._av_load(str(path))
+            self.assertEqual(sr, 16000)
+            self.assertEqual(y.ndim, 1)
+            # ~2s of audio decoded
+            self.assertGreater(len(y), 16000)
+
+    def test_librosa_or_sf_load_falls_back_to_av_for_m4a(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tone.m4a"
+            self.make_m4a(path)
+            y, sr = td.librosa_or_sf_load(str(path))
+            self.assertEqual(sr, 16000)
+            self.assertGreater(len(y), 16000)
+
+    def test_unsupported_file_raises_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "garbage.m4a"
+            path.write_bytes(b"not audio at all" * 16)
+            with self.assertRaises(RuntimeError) as ctx:
+                td.librosa_or_sf_load(str(path))
+            self.assertIn("Could not decode", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

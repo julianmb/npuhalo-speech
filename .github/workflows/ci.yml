@@ -18,7 +18,7 @@ jobs:
         run: python3 -m py_compile scripts/*.py tests/*.py
 
       - name: Install light test dependencies
-        run: pip install "numpy" "soundfile>=0.12.1" "requests>=2.31.0"
+        run: pip install "numpy" "soundfile>=0.12.1" "requests>=2.31.0" "av>=11.0.0"
 
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v

@@ -200,7 +200,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                         <i class="fa-solid fa-file-lines text-indigo-400 text-lg"></i>
                         <div class="truncate">
                             <p id="fileName" class="text-xs font-medium text-slate-200 truncate">audio.wav</p>
-                            <p id="fileSize" class="text-[10px] text-slate-400">0 MB</p>
+                            <p class="text-[10px] text-slate-400"><span id="fileSize">0 MB</span><span id="fileDuration" class="hidden"> · <span class="font-mono"></span></span></p>
                         </div>
                     </div>
                     <button id="removeFileBtn" aria-label="Remove selected file" class="text-slate-400 hover:text-red-400 p-1">
@@ -320,6 +320,13 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 <div id="emptyState" class="flex-1 flex flex-col items-center justify-center py-16 text-slate-500">
                     <i class="fa-solid fa-comments text-4xl mb-3 text-slate-700"></i>
                     <p class="text-sm">Upload or record audio to generate the speaker-attributed transcript.</p>
+                    <div id="recentList" class="hidden w-full max-w-md mt-8 text-left">
+                        <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-2 flex items-center gap-2">
+                            <i class="fa-solid fa-clock-rotate-left"></i> Recent transcripts
+                            <button id="clearHistoryBtn" class="ml-auto text-[10px] normal-case tracking-normal text-slate-500 hover:text-rose-400">Clear</button>
+                        </p>
+                        <div id="recentItems" class="space-y-1.5"></div>
+                    </div>
                 </div>
 
                 <!-- Loading State: Progress Stepper -->
@@ -498,6 +505,9 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         const statTurns = document.getElementById('statTurns');
         const statDuration = document.getElementById('statDuration');
         const statLatency = document.getElementById('statLatency');
+        const recentList = document.getElementById('recentList');
+        const recentItems = document.getElementById('recentItems');
+        const clearHistoryBtn = document.getElementById('clearHistoryBtn');
         const renameModal = document.getElementById('renameModal');
         const renameRawLabel = document.getElementById('renameRawLabel');
         const renameInput = document.getElementById('renameInput');
@@ -741,15 +751,46 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             if (e.target.files.length > 0) handleFile(e.target.files[0]);
         });
 
+        const MAX_FILE_BYTES = 500 * 1024 * 1024; // 500 MB soft limit (server also enforces)
+        const MAX_DURATION_SEC = 3 * 3600; // 3 h
+
+        function formatDuration(sec) {
+            if (!isFinite(sec) || sec <= 0) return '';
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = Math.floor(sec % 60);
+            return h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+        }
+
         function handleFile(file) {
+            if (file.size > MAX_FILE_BYTES) {
+                showToast(`File too large (${(file.size / (1024*1024)).toFixed(0)} MB) — limit is ${MAX_FILE_BYTES / (1024*1024)} MB.`, 'error');
+                return;
+            }
             selectedFile = file;
             fileName.textContent = file.name;
             fileSize.textContent = (file.size / (1024 * 1024)).toFixed(2) + ' MB';
+            const durWrap = document.getElementById('fileDuration');
+            durWrap.classList.add('hidden');
             fileInfoCard.classList.remove('hidden');
             processBtn.disabled = false;
 
             setAudioSource(file);
             audioPlayerContainer.classList.remove('hidden');
+
+            // Duration preview once metadata is available
+            const onMeta = () => {
+                const d = audioPreview.duration;
+                if (isFinite(d) && d > 0) {
+                    durWrap.querySelector('span').textContent = formatDuration(d);
+                    durWrap.classList.remove('hidden');
+                    if (d > MAX_DURATION_SEC) {
+                        showToast(`Long audio (${formatDuration(d)}) — transcription may take several minutes.`, 'info');
+                    }
+                }
+                audioPreview.removeEventListener('loadedmetadata', onMeta);
+            };
+            audioPreview.addEventListener('loadedmetadata', onMeta);
         }
 
         removeFileBtn.addEventListener('click', () => {
@@ -761,6 +802,69 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             audioPreview.src = '';
             processBtn.disabled = true;
         });
+
+        // ---------- Recent Transcript History ----------
+        const HISTORY_KEY = 'strix_history';
+        const getHistory = () => { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return []; } };
+        const saveHistory = (h) => localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 5)));
+
+        function renderHistory() {
+            const hist = getHistory();
+            recentItems.innerHTML = '';
+            if (!hist.length) {
+                recentList.classList.add('hidden');
+                return;
+            }
+            hist.forEach((item, i) => {
+                const row = document.createElement('button');
+                row.className = 'w-full flex items-center gap-2 px-3 py-2 bg-slate-800/40 border border-slate-800 rounded-lg text-left hover:border-indigo-500/50 transition group';
+                row.innerHTML = `
+                    <i class="fa-solid fa-file-audio text-[10px] text-slate-500 group-hover:text-indigo-400"></i>
+                    <span class="text-[11px] text-slate-300 truncate flex-1">${escapeHtml(item.name)}</span>
+                    <span class="text-[9px] font-mono text-slate-500 whitespace-nowrap">${escapeHtml(item.when)} · ${item.turns} turns</span>
+                    <span class="text-[9px] text-indigo-400 opacity-0 group-hover:opacity-100 transition">load</span>`;
+                row.onclick = () => restoreHistory(i);
+                recentItems.appendChild(row);
+            });
+            recentList.classList.remove('hidden');
+        }
+
+        function rememberTranscript(name, data) {
+            const hist = getHistory();
+            hist.unshift({
+                name,
+                when: new Date().toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+                turns: (data.segments || []).length,
+                data
+            });
+            saveHistory(hist);
+            renderHistory();
+        }
+
+        function restoreHistory(idx) {
+            const item = getHistory()[idx];
+            if (!item) return;
+            lastResponseData = item.data;
+            speakerNameMap = {};
+            activeSpeakerFilter = 'ALL';
+            searchInput.value = '';
+            emptyState.classList.add('hidden');
+            transcriptFeed.classList.remove('hidden');
+            exportGroup.classList.remove('hidden');
+            filterBar.classList.remove('hidden');
+            renderTranscript();
+            renderSummary(lastResponseData);
+            showToast(`Restored "${item.name}" (${item.turns} turns).`, 'info');
+        }
+
+        clearHistoryBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            localStorage.removeItem(HISTORY_KEY);
+            renderHistory();
+            showToast('History cleared.', 'info');
+        });
+
+        renderHistory();
 
         // ---------- Progress Stepper ----------
         function setStep(stepEl, state) {
@@ -923,6 +1027,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 activeSpeakerFilter = 'ALL';
                 renderTranscript();
                 renderSummary(data);
+                rememberTranscript(selectedFile.name, data);
                 showToast('Transcription complete: ' + (data.segments || []).length + ' speaker turns.', 'success');
 
             } catch (err) {
@@ -1297,10 +1402,18 @@ async def create_transcription(
     """
     OpenAI-compatible speech transcription & speaker diarization endpoint.
     """
+    MAX_UPLOAD_BYTES = 500 * 1024 * 1024
     file_suffix = Path(file.filename).suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
         tmp_path = tmp.name
         content = await file.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise HTTPException(
+                status_code=413,
+                detail={"error": {"message": f"File too large ({len(content) / (1024*1024):.0f} MB) — limit is 500 MB.", "type": "invalid_request_error", "code": "file_too_large"}},
+            )
         tmp.write(content)
 
     active_device = device or SERVER_CONFIG["default_device"]
@@ -1368,9 +1481,9 @@ async def create_transcription(
                         "speaker": r["speaker"],
                         "tokens": [],
                         "temperature": temperature or 0.0,
-                        "avg_logprob": -0.1,
-                        "compression_ratio": 1.0,
-                        "no_speech_prob": 0.0,
+                        "avg_logprob": None,
+                        "compression_ratio": None,
+                        "no_speech_prob": None,
                         "npu_latency_ms": r.get("latency_ms", 0.0),
                         "backend": r.get("backend", "")
                     })
