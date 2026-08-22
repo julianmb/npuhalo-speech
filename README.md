@@ -86,6 +86,9 @@ CI runs the same checks on every push and PR (see `.github/workflows/ci.yml`).
 See `requirements.txt` — `torch`, `pyannote.audio`, `faster-whisper`, `librosa`, `soundfile`, `fastapi`/`uvicorn`, etc. The launchers create a `.venv` automatically on first run.
 
 ## Related
-- **npuhalo** — NPU research (TTFT, routing, full system benchmarks)
-- **halofpx** — Unified LLM server for Strix Halo
-- **q38rocm** — Qwen 3.8 27B deep-dive
+
+Part of the **npuhalo** research family for AMD Strix Halo:
+
+- **[npuhalo](https://github.com/julianmb/npuhalo)** — NPU + iGPU live verification, compression, and routing research on Strix Halo
+- **[halofpx](https://github.com/julianmb/halofpx)** — Unified OpenAI-compatible LLM server: tuned ROCmFP4 quants, validated 262K context, vision, hot-swap model zoo (iGPU + NPU)
+- **[q38rocm](https://github.com/julianmb/q38rocm)** — Qwen 3.8 27B ROCmFP4 deep-dive: up to 36 tok/s via MTP Speculation, TurboQuant & Mesa RADV Wave64
