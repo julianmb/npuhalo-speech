@@ -11,12 +11,13 @@ Features:
 """
 
 import os
+import time
 import secrets
 import tempfile
 import argparse
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException, Depends, status
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, HTMLResponse
@@ -59,6 +60,10 @@ SERVER_CONFIG = {
 
 # Serialize heavy pipeline work to protect the NPU/GPU from concurrent thrashing
 PIPELINE_SEMAPHORE = threading.Semaphore(1)
+
+# Live job progress for client polling: {job_id: {"stage": ..., "detail": ..., "pct": ...}}
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
 
 
 def run_pipeline_blocking(fn, *args, **kwargs):
@@ -121,6 +126,8 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         .speaker-4 { border-left-color: #ec4899; background: rgba(236, 72, 153, 0.08); }
         @keyframes pulse-recording { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.05); } }
         .rec-active { animation: pulse-recording 1.5s infinite ease-in-out; }
+        @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .seg-active { box-shadow: inset 0 0 0 1px rgb(99 102 241 / 0.6); }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans antialiased">
@@ -144,17 +151,14 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             <!-- API Key & Status -->
             <div class="flex items-center space-x-3">
                 <div id="statusBadge" class="hidden sm:flex items-center gap-1.5 text-xs bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 px-3 py-1.5 rounded-lg">
-                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                    NPU Ready
+                    <span id="statusDot" class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span id="statusText">NPU Ready</span>
                 </div>
-                <div class="relative flex items-center">
-                    <i class="fa-solid fa-key absolute left-3 text-slate-500 text-xs"></i>
-                    <input type="password" id="apiKeyInput" placeholder="Enter API Key..." 
-                           class="bg-slate-800/80 border border-slate-700 text-xs rounded-lg pl-8 pr-8 py-1.5 w-48 sm:w-64 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-200 placeholder-slate-500 transition">
-                    <button id="saveKeyBtn" title="Save API Key" class="absolute right-2 text-xs text-slate-400 hover:text-indigo-400">
-                        <i class="fa-solid fa-check"></i>
-                    </button>
-                </div>
+                <button id="lockBtn" title="Change API Key" aria-label="Change API Key"
+                        class="text-xs bg-slate-800/80 border border-slate-700 text-slate-400 hover:text-indigo-400 px-3 py-1.5 rounded-lg transition flex items-center gap-1.5">
+                    <i id="lockIcon" class="fa-solid fa-lock"></i>
+                    <span class="hidden sm:inline">Locked</span>
+                </button>
             </div>
         </div>
     </header>
@@ -173,7 +177,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     </h2>
                     
                     <!-- Live Mic Record Button -->
-                    <button id="micBtn" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-2">
+                    <button id="micBtn" aria-label="Record from microphone" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-2">
                         <i id="micIcon" class="fa-solid fa-microphone text-rose-400"></i>
                         <span id="micLabel">Record Mic</span>
                         <span id="recTimer" class="hidden font-mono text-[11px] text-rose-400 font-bold">00:00</span>
@@ -199,7 +203,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                             <p id="fileSize" class="text-[10px] text-slate-400">0 MB</p>
                         </div>
                     </div>
-                    <button id="removeFileBtn" class="text-slate-400 hover:text-red-400 p-1">
+                    <button id="removeFileBtn" aria-label="Remove selected file" class="text-slate-400 hover:text-red-400 p-1">
                         <i class="fa-solid fa-xmark"></i>
                     </button>
                 </div>
@@ -220,9 +224,19 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     <div>
                         <label class="block text-xs font-medium text-slate-300 mb-1">Diarization Device</label>
                         <select id="deviceSelect" class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-3 py-2 text-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none">
-                            <option value="cpu" selected>Zen 5 CPU (Default)</option>
+                            <option value="cpu" selected>Zen 5 CPU</option>
                             <option value="rocm">Radeon GPU (ROCm)</option>
                             <option value="auto">Auto-Detect</option>
+                        </select>
+                    </div>
+
+                    <div>
+                        <label class="block text-xs font-medium text-slate-300 mb-1">Transcription Engine</label>
+                        <select id="asrSelect" class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-3 py-2 text-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none">
+                            <option value="auto" selected>Auto (NPU → Local)</option>
+                            <option value="npu">NPU only (XDNA 2)</option>
+                            <option value="cpu">Local CPU</option>
+                            <option value="gpu">Local GPU (ROCm/CUDA)</option>
                         </select>
                     </div>
 
@@ -231,12 +245,12 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                         <input type="number" id="numSpeakersInput" placeholder="Auto" min="1" max="20"
                                class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-3 py-2 text-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none">
                     </div>
-                </div>
 
-                <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1">Language</label>
-                    <input type="text" id="langInput" placeholder="Auto-Detect (or 'en', 'es', 'zh', 'fr')"
-                           class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-3 py-2 text-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none">
+                    <div>
+                        <label class="block text-xs font-medium text-slate-300 mb-1">Language</label>
+                        <input type="text" id="langInput" placeholder="Auto-Detect"
+                               class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-3 py-2 text-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none">
+                    </div>
                 </div>
 
                 <div class="pt-2">
@@ -274,8 +288,14 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                         <button id="copyBtn" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5">
                             <i class="fa-solid fa-copy"></i> Copy
                         </button>
+                        <button id="downloadTxtBtn" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5">
+                            <i class="fa-solid fa-file-lines"></i> .TXT
+                        </button>
                         <button id="downloadSrtBtn" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5">
                             <i class="fa-solid fa-download"></i> .SRT
+                        </button>
+                        <button id="downloadVttBtn" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5">
+                            <i class="fa-solid fa-closed-captioning"></i> .VTT
                         </button>
                         <button id="downloadJsonBtn" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5">
                             <i class="fa-solid fa-file-code"></i> JSON
@@ -287,9 +307,10 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 <div id="filterBar" class="hidden flex flex-col sm:flex-row items-stretch sm:items-center gap-3 mb-4">
                     <div class="relative flex-1">
                         <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-500 text-xs"></i>
-                        <input type="text" id="searchInput" placeholder="Search transcript text..." 
+                        <input type="text" id="searchInput" placeholder="Search transcript text..."
                                class="w-full bg-slate-800/70 border border-slate-700 text-xs rounded-lg pl-8 pr-3 py-2 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500">
                     </div>
+                    <span id="matchCount" class="hidden text-[10px] font-mono text-slate-500 whitespace-nowrap"></span>
                     <div id="speakerFilterPills" class="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
                         <!-- Speaker filter pills rendered dynamically -->
                     </div>
@@ -301,11 +322,83 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     <p class="text-sm">Upload or record audio to generate the speaker-attributed transcript.</p>
                 </div>
 
-                <!-- Loading State -->
-                <div id="loadingState" class="hidden flex-1 flex flex-col items-center justify-center py-16">
-                    <div class="w-12 h-12 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin mb-4"></div>
-                    <p id="loadingMsg" class="text-sm font-medium text-slate-200">Processing Audio on AMD Strix Halo...</p>
-                    <p class="text-xs text-slate-400 mt-1">Diarizing on CPU & transcribing turns on XDNA 2 NPU</p>
+                <!-- Loading State: Progress Stepper -->
+                <div id="loadingState" class="hidden flex-1 flex flex-col items-center justify-center py-12">
+                    <div class="w-full max-w-md space-y-5">
+                        <!-- Step 1: Upload -->
+                        <div id="stepUpload" class="flex items-start gap-3">
+                            <div class="stepDot w-7 h-7 shrink-0 rounded-full border-2 border-slate-700 bg-slate-800 flex items-center justify-center text-[10px] text-slate-500 transition-all duration-300">
+                                <i class="fa-solid fa-arrow-up"></i>
+                            </div>
+                            <div class="flex-1 pt-0.5">
+                                <div class="flex justify-between items-baseline">
+                                    <span class="text-xs font-medium text-slate-400">Uploading audio</span>
+                                    <span id="uploadPct" class="text-[10px] font-mono text-slate-500"></span>
+                                </div>
+                                <div class="h-1.5 bg-slate-800 rounded-full mt-1.5 overflow-hidden">
+                                    <div id="uploadBar" class="h-full bg-indigo-500 w-0 transition-all duration-200"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Step 2: Diarization -->
+                        <div id="stepDiarize" class="flex items-start gap-3">
+                            <div class="stepDot w-7 h-7 shrink-0 rounded-full border-2 border-slate-700 bg-slate-800 flex items-center justify-center text-[10px] text-slate-500 transition-all duration-300">
+                                <i class="fa-solid fa-users-viewfinder"></i>
+                            </div>
+                            <div class="flex-1 pt-0.5">
+                                <div class="flex justify-between items-baseline">
+                                    <span class="text-xs font-medium text-slate-400">Speaker diarization</span>
+                                    <span id="diarizeDetail" class="text-[10px] font-mono text-slate-500"></span>
+                                </div>
+                                <p id="diarizeSub" class="text-[10px] text-slate-600 mt-1">Identifying who speaks when</p>
+                            </div>
+                        </div>
+
+                        <!-- Step 3: Transcription -->
+                        <div id="stepTranscribe" class="flex items-start gap-3">
+                            <div class="stepDot w-7 h-7 shrink-0 rounded-full border-2 border-slate-700 bg-slate-800 flex items-center justify-center text-[10px] text-slate-500 transition-all duration-300">
+                                <i class="fa-solid fa-feather"></i>
+                            </div>
+                            <div class="flex-1 pt-0.5">
+                                <div class="flex justify-between items-baseline">
+                                    <span class="text-xs font-medium text-slate-400">Transcribing turns</span>
+                                    <span id="transcribeDetail" class="text-[10px] font-mono text-slate-500"></span>
+                                </div>
+                                <div class="h-1.5 bg-slate-800 rounded-full mt-1.5 overflow-hidden">
+                                    <div id="transcribeBar" class="h-full bg-emerald-500 w-0 transition-all duration-300"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Elapsed -->
+                        <div class="flex items-center justify-center gap-2 pt-2 text-[11px] text-slate-500">
+                            <i class="fa-solid fa-stopwatch text-[9px]"></i>
+                            <span id="elapsedTimer" class="font-mono">0s</span> elapsed
+                            ·
+                            <span id="engineLabel" class="text-slate-400">Auto engine</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Results Summary -->
+                <div id="summaryStrip" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+                    <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5">
+                        <p class="text-[9px] uppercase tracking-wider text-slate-500">Speakers</p>
+                        <p id="statSpeakers" class="text-lg font-bold text-indigo-400 leading-tight">–</p>
+                    </div>
+                    <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5">
+                        <p class="text-[9px] uppercase tracking-wider text-slate-500">Turns</p>
+                        <p id="statTurns" class="text-lg font-bold text-slate-200 leading-tight">–</p>
+                    </div>
+                    <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5">
+                        <p class="text-[9px] uppercase tracking-wider text-slate-500">Duration</p>
+                        <p id="statDuration" class="text-lg font-bold text-slate-200 leading-tight">–</p>
+                    </div>
+                    <div class="bg-slate-800/40 border border-slate-800 rounded-xl px-3 py-2.5">
+                        <p class="text-[9px] uppercase tracking-wider text-slate-500">Avg Latency</p>
+                        <p id="statLatency" class="text-lg font-bold text-emerald-400 leading-tight">–</p>
+                    </div>
                 </div>
 
                 <!-- Transcript Output Container -->
@@ -318,6 +411,43 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         </div>
 
     </main>
+
+    <!-- Auth Gate -->
+    <div id="authGate" class="fixed inset-0 z-[200] bg-slate-950 flex items-center justify-center p-4">
+        <div class="w-full max-w-sm bg-slate-900/60 border border-slate-800 rounded-2xl p-8 shadow-2xl text-center">
+            <div class="w-14 h-14 mx-auto rounded-2xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center mb-4 shadow-lg shadow-indigo-500/20">
+                <i class="fa-solid fa-microphone-lines text-white text-xl"></i>
+            </div>
+            <h2 class="font-bold text-lg text-slate-100 tracking-tight">Strix Halo Speech Studio</h2>
+            <p class="text-xs text-slate-400 mt-1 mb-6">Enter the server API key to unlock</p>
+            <div class="relative">
+                <i class="fa-solid fa-key absolute left-3 top-2.5 text-slate-500 text-xs"></i>
+                <input type="password" id="gateKeyInput" placeholder="API Key" autocomplete="current-password"
+                       class="w-full bg-slate-800/80 border border-slate-700 text-sm rounded-lg pl-8 pr-3 py-2 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            </div>
+            <p id="gateError" class="hidden text-[11px] text-rose-400 mt-2"></p>
+            <button id="gateUnlockBtn" class="w-full mt-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm rounded-xl shadow-lg shadow-indigo-600/20 transition flex items-center justify-center gap-2">
+                <i class="fa-solid fa-unlock"></i> Unlock Studio
+            </button>
+        </div>
+    </div>
+
+    <!-- Rename Speaker Modal -->
+    <div id="renameModal" class="hidden fixed inset-0 z-[90] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl p-6 w-full max-w-sm shadow-2xl">
+            <h3 class="text-sm font-semibold text-slate-200 mb-1">Rename Speaker</h3>
+            <p id="renameRawLabel" class="text-[11px] font-mono text-slate-500 mb-4"></p>
+            <input id="renameInput" type="text"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-4">
+            <div class="flex justify-end gap-2">
+                <button id="renameCancelBtn" class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 transition">Cancel</button>
+                <button id="renameSaveBtn" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium transition">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div id="toastContainer" class="fixed bottom-6 right-6 z-[100] space-y-2 max-w-sm"></div>
 
     <script>
         // DOM Elements
@@ -337,11 +467,43 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         const filterBar = document.getElementById('filterBar');
         const searchInput = document.getElementById('searchInput');
         const speakerFilterPills = document.getElementById('speakerFilterPills');
-        const apiKeyInput = document.getElementById('apiKeyInput');
-        const saveKeyBtn = document.getElementById('saveKeyBtn');
+        const lockBtn = document.getElementById('lockBtn');
+        const lockIcon = document.getElementById('lockIcon');
+        const authGate = document.getElementById('authGate');
+        const gateKeyInput = document.getElementById('gateKeyInput');
+        const gateUnlockBtn = document.getElementById('gateUnlockBtn');
+        const gateError = document.getElementById('gateError');
         const copyBtn = document.getElementById('copyBtn');
         const downloadSrtBtn = document.getElementById('downloadSrtBtn');
         const downloadJsonBtn = document.getElementById('downloadJsonBtn');
+        const downloadTxtBtn = document.getElementById('downloadTxtBtn');
+        const downloadVttBtn = document.getElementById('downloadVttBtn');
+        const matchCount = document.getElementById('matchCount');
+        const statusBadge = document.getElementById('statusBadge');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const elapsedTimer = document.getElementById('elapsedTimer');
+        const engineLabel = document.getElementById('engineLabel');
+        const stepUpload = document.getElementById('stepUpload');
+        const stepDiarize = document.getElementById('stepDiarize');
+        const stepTranscribe = document.getElementById('stepTranscribe');
+        const uploadBar = document.getElementById('uploadBar');
+        const uploadPct = document.getElementById('uploadPct');
+        const diarizeDetail = document.getElementById('diarizeDetail');
+        const diarizeSub = document.getElementById('diarizeSub');
+        const transcribeBar = document.getElementById('transcribeBar');
+        const transcribeDetail = document.getElementById('transcribeDetail');
+        const summaryStrip = document.getElementById('summaryStrip');
+        const statSpeakers = document.getElementById('statSpeakers');
+        const statTurns = document.getElementById('statTurns');
+        const statDuration = document.getElementById('statDuration');
+        const statLatency = document.getElementById('statLatency');
+        const renameModal = document.getElementById('renameModal');
+        const renameRawLabel = document.getElementById('renameRawLabel');
+        const renameInput = document.getElementById('renameInput');
+        const renameSaveBtn = document.getElementById('renameSaveBtn');
+        const renameCancelBtn = document.getElementById('renameCancelBtn');
+        const toastContainer = document.getElementById('toastContainer');
 
         // Microphone Elements
         const micBtn = document.getElementById('micBtn');
@@ -357,20 +519,159 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         let audioChunks = [];
         let timerInterval = null;
         let recordingSeconds = 0;
+        let currentObjectUrl = null;
+        let renameTarget = null;
+        let pollTimer = null;
 
-        // Init API Key from LocalStorage
-        const savedKey = localStorage.getItem('strix_api_key');
-        if (savedKey) { apiKeyInput.value = savedKey; }
+        // ---------- Helpers ----------
+        function escapeHtml(str) {
+            return String(str ?? '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
 
-        saveKeyBtn.addEventListener('click', () => {
-            localStorage.setItem('strix_api_key', apiKeyInput.value.trim());
-            saveKeyBtn.classList.add('text-emerald-400');
-            setTimeout(() => saveKeyBtn.classList.remove('text-emerald-400'), 1500);
-        });
+        function escapeRegExp(str) {
+            return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
 
-        apiKeyInput.addEventListener('change', () => {
-            localStorage.setItem('strix_api_key', apiKeyInput.value.trim());
-        });
+        function showToast(message, type = 'error') {
+            const toast = document.createElement('div');
+            const styles = {
+                error: 'bg-rose-950/90 border-rose-500/40 text-rose-200',
+                success: 'bg-emerald-950/90 border-emerald-500/40 text-emerald-200',
+                info: 'bg-slate-900/90 border-slate-600/50 text-slate-200'
+            };
+            const icons = { error: 'fa-circle-exclamation', success: 'fa-circle-check', info: 'fa-circle-info' };
+            toast.className = `flex items-start gap-2 text-xs px-4 py-3 rounded-xl border shadow-xl backdrop-blur ${styles[type] || styles.info} animate-[toast-in_.2s_ease-out]`;
+            toast.innerHTML = `<i class="fa-solid ${icons[type] || icons.info} mt-0.5"></i><span class="leading-relaxed">${escapeHtml(message)}</span>`;
+            toastContainer.appendChild(toast);
+            setTimeout(() => {
+                toast.style.transition = 'opacity .3s';
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 300);
+            }, 4500);
+        }
+
+        function setAudioSource(file) {
+            if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+            currentObjectUrl = URL.createObjectURL(file);
+            audioPreview.src = currentObjectUrl;
+        }
+
+        // Live NPU status badge
+        async function refreshStatus() {
+            try {
+                const res = await fetch('/health');
+                const h = await res.json();
+                if (h.npu_backend === 'connected') {
+                    statusDot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+                    statusText.textContent = 'NPU Ready';
+                    statusBadge.className = statusBadge.className.replace(/bg-\S+\/10 border-\S+\/20 text-\S+/, 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400');
+                } else {
+                    statusDot.className = 'w-2 h-2 rounded-full bg-amber-400';
+                    statusText.textContent = 'NPU Offline · Local Fallback';
+                    statusBadge.className = statusBadge.className.replace(/bg-\S+\/10 border-\S+\/20 text-\S+/, 'bg-amber-500/10 border-amber-500/20 text-amber-400');
+                }
+            } catch {
+                statusDot.className = 'w-2 h-2 rounded-full bg-rose-500';
+                statusText.textContent = 'Server Unreachable';
+            }
+        }
+        refreshStatus();
+        setInterval(refreshStatus, 15000);
+
+        // Convert recorded audio (webm/ogg) into a real 16-bit PCM WAV file
+        async function convertToWavFile(blob, filename) {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            try {
+                const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+                const numCh = Math.min(buf.numberOfChannels, 2);
+                const len = buf.length;
+                const wav = new ArrayBuffer(44 + len * numCh * 2);
+                const view = new DataView(wav);
+                const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+                writeStr(0, 'RIFF'); view.setUint32(4, 36 + len * numCh * 2, true); writeStr(8, 'WAVE');
+                writeStr(12, 'fmt '); view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true); view.setUint16(22, numCh, true);
+                view.setUint32(24, buf.sampleRate, true); view.setUint32(28, buf.sampleRate * numCh * 2, true);
+                view.setUint16(32, numCh * 2, true); view.setUint16(34, 16, true);
+                writeStr(36, 'data'); view.setUint32(40, len * numCh * 2, true);
+                const chans = [];
+                for (let c = 0; c < numCh; c++) chans.push(buf.getChannelData(c));
+                let off = 44;
+                for (let i = 0; i < len; i++) {
+                    for (let c = 0; c < numCh; c++) {
+                        const v = Math.max(-1, Math.min(1, chans[c][i]));
+                        view.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
+                        off += 2;
+                    }
+                }
+                return new File([wav], filename, { type: 'audio/wav' });
+            } finally {
+                ctx.close();
+            }
+        }
+
+        // ---------- Auth Gate ----------
+        const getApiKey = () => localStorage.getItem('strix_api_key') || '';
+
+        function showGate(message) {
+            gateError.textContent = message || '';
+            gateError.classList.toggle('hidden', !message);
+            authGate.classList.remove('hidden');
+            gateKeyInput.value = '';
+            setTimeout(() => gateKeyInput.focus(), 50);
+        }
+
+        function hideGate() {
+            authGate.classList.add('hidden');
+            lockIcon.className = 'fa-solid fa-lock-open';
+            lockBtn.querySelector('span').textContent = 'Unlocked';
+        }
+
+        async function validateKey(key) {
+            try {
+                const res = await fetch('/v1/models', { headers: { 'Authorization': 'Bearer ' + key } });
+                return res.ok;
+            } catch {
+                return false;
+            }
+        }
+
+        async function initAuth() {
+            const key = getApiKey();
+            if (key && await validateKey(key)) {
+                hideGate();
+            } else {
+                if (key) localStorage.removeItem('strix_api_key');
+                showGate();
+            }
+        }
+        initAuth();
+
+        async function attemptUnlock() {
+            const key = gateKeyInput.value.trim();
+            if (!key) {
+                gateError.textContent = 'Please enter the API key.';
+                gateError.classList.remove('hidden');
+                return;
+            }
+            gateUnlockBtn.disabled = true;
+            const ok = await validateKey(key);
+            gateUnlockBtn.disabled = false;
+            if (ok) {
+                localStorage.setItem('strix_api_key', key);
+                hideGate();
+                showToast('Studio unlocked.', 'success');
+                refreshStatus();
+            } else {
+                showGate('Invalid API key. Check the value printed when the server started.');
+            }
+        }
+
+        gateUnlockBtn.addEventListener('click', attemptUnlock);
+        gateKeyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') attemptUnlock(); });
+        lockBtn.addEventListener('click', () => showGate());
 
         // 1. Live Microphone Recording
         micBtn.addEventListener('click', async () => {
@@ -394,10 +695,14 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                         if (e.data.size > 0) audioChunks.push(e.data);
                     };
 
-                    mediaRecorder.onstop = () => {
-                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                        const audioFile = new File([audioBlob], `mic_recording_${Date.now()}.wav`, { type: 'audio/wav' });
-                        handleFile(audioFile);
+                    mediaRecorder.onstop = async () => {
+                        const audioBlob = new Blob(audioChunks);
+                        try {
+                            const wavFile = await convertToWavFile(audioBlob, `mic_recording_${Date.now()}.wav`);
+                            handleFile(wavFile);
+                        } catch (err) {
+                            showToast('Could not process recording: ' + err.message);
+                        }
                         stream.getTracks().forEach(track => track.stop());
                     };
 
@@ -418,7 +723,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     }, 1000);
 
                 } catch (err) {
-                    alert('Microphone access denied: ' + err.message);
+                    showToast('Microphone access denied: ' + err.message);
                 }
             }
         });
@@ -443,8 +748,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             fileInfoCard.classList.remove('hidden');
             processBtn.disabled = false;
 
-            const objectUrl = URL.createObjectURL(file);
-            audioPreview.src = objectUrl;
+            setAudioSource(file);
             audioPlayerContainer.classList.remove('hidden');
         }
 
@@ -453,64 +757,208 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             fileInput.value = '';
             fileInfoCard.classList.add('hidden');
             audioPlayerContainer.classList.add('hidden');
+            if (currentObjectUrl) { URL.revokeObjectURL(currentObjectUrl); currentObjectUrl = null; }
             audioPreview.src = '';
             processBtn.disabled = true;
         });
 
+        // ---------- Progress Stepper ----------
+        function setStep(stepEl, state) {
+            const dot = stepEl.querySelector('.stepDot');
+            const icon = dot.querySelector('i');
+            const label = stepEl.querySelector('span');
+            dot.classList.remove('border-slate-700', 'bg-slate-800', 'text-slate-500',
+                                 'border-indigo-500', 'text-indigo-400', 'animate-pulse',
+                                 '!bg-emerald-500/10', '!border-emerald-500', '!text-emerald-400');
+            label.classList.remove('text-slate-400', 'text-slate-200', 'text-slate-500');
+            if (state === 'active') {
+                dot.classList.add('border-indigo-500', 'text-indigo-400', 'animate-pulse');
+                label.classList.add('text-slate-200');
+            } else if (state === 'done') {
+                dot.classList.add('!bg-emerald-500/10', '!border-emerald-500', '!text-emerald-400');
+                label.classList.add('text-slate-400');
+                icon.className = 'fa-solid fa-check';
+            } else {
+                dot.classList.add('border-slate-700', 'bg-slate-800', 'text-slate-500');
+                label.classList.add('text-slate-500');
+            }
+        }
+
+        function resetSteps() {
+            setStep(stepUpload, 'pending');
+            setStep(stepDiarize, 'pending');
+            setStep(stepTranscribe, 'pending');
+            uploadBar.style.width = '0%';
+            uploadPct.textContent = '';
+            diarizeDetail.textContent = '';
+            transcribeDetail.textContent = '';
+            transcribeBar.style.width = '0%';
+            // Restore original icons
+            stepUpload.querySelector('i').className = 'fa-solid fa-arrow-up';
+            stepDiarize.querySelector('i').className = 'fa-solid fa-users-viewfinder';
+            stepTranscribe.querySelector('i').className = 'fa-solid fa-feather';
+        }
+
+        function applyProgress(p) {
+            if (!p || !p.stage) return;
+            if (p.stage === 'load' || p.stage === 'diarize') {
+                setStep(stepUpload, 'done');
+                setStep(stepDiarize, 'active');
+                diarizeDetail.textContent = p.detail || '';
+                if (p.stage === 'load') diarizeSub.textContent = p.detail || '';
+                else diarizeSub.textContent = 'Identifying who speaks when';
+            } else if (p.stage === 'transcribe') {
+                setStep(stepUpload, 'done');
+                setStep(stepDiarize, 'done');
+                setStep(stepTranscribe, 'active');
+                transcribeDetail.textContent = p.detail || '';
+                if (typeof p.pct === 'number') transcribeBar.style.width = p.pct + '%';
+            } else if (p.stage === 'done') {
+                setStep(stepUpload, 'done');
+                setStep(stepDiarize, 'done');
+                setStep(stepTranscribe, 'done');
+                transcribeBar.style.width = '100%';
+            }
+        }
+
+        function startProgressPolling(jobId) {
+            const poll = async () => {
+                try {
+                    const res = await fetch('/v1/progress/' + jobId, { headers: { 'Authorization': 'Bearer ' + getApiKey() } });
+                    if (res.ok) applyProgress(await res.json());
+                } catch { /* transient */ }
+            };
+            pollTimer = setInterval(poll, 1000);
+            poll();
+        }
+
+        function stopProgressPolling() {
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
         // Process Request
+        function transcribeWithProgress(formData, headers) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/v1/audio/transcriptions');
+                if (headers.Authorization) xhr.setRequestHeader('Authorization', headers.Authorization);
+                xhr.upload.onprogress = (e) => {
+                    if (!e.lengthComputable) return;
+                    const pct = Math.round((e.loaded / e.total) * 100);
+                    uploadBar.style.width = pct + '%';
+                    uploadPct.textContent = pct >= 100 ? 'done' : pct + '%';
+                    if (pct >= 100) setStep(stepUpload, 'done');
+                };
+                xhr.onload = () => {
+                    let data = null;
+                    try { data = JSON.parse(xhr.responseText); } catch (e) { /* non-JSON */ }
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve(data);
+                    } else {
+                        let msg = data?.detail?.error?.message || data?.detail || ('HTTP Error ' + xhr.status);
+                        if (xhr.status === 401) {
+                            msg = 'Unauthorized — enter your API key in the field at the top right, then try again.';
+                        }
+                        reject(new Error(msg));
+                    }
+                };
+                xhr.onerror = () => reject(new Error('Network error while contacting the server.'));
+                xhr.send(formData);
+            });
+        }
+
         processBtn.addEventListener('click', async () => {
             if (!selectedFile) return;
 
-            const apiKey = apiKeyInput.value.trim();
+            const apiKey = getApiKey();
+            if (!apiKey) {
+                showGate('Enter your API key to start.');
+                return;
+            }
             const device = document.getElementById('deviceSelect').value;
+            const asrBackend = document.getElementById('asrSelect').value;
             const numSpeakers = document.getElementById('numSpeakersInput').value;
             const language = document.getElementById('langInput').value;
+            let jobId;
+            try { jobId = crypto.randomUUID(); } catch { jobId = 'job-' + Date.now() + '-' + Math.random().toString(36).slice(2); }
 
             emptyState.classList.add('hidden');
             transcriptFeed.classList.add('hidden');
             exportGroup.classList.add('hidden');
             filterBar.classList.add('hidden');
+            summaryStrip.classList.add('hidden');
             loadingState.classList.remove('hidden');
+            resetSteps();
             processBtn.disabled = true;
+
+            const engineNames = { auto: 'Auto engine', npu: 'NPU (XDNA 2)', cpu: 'Local CPU', gpu: 'Local GPU' };
+            engineLabel.textContent = engineNames[asrBackend] || 'Auto engine';
+
+            const procStart = Date.now();
+            elapsedTimer.textContent = '0s';
+            const elapsedInterval = setInterval(() => {
+                elapsedTimer.textContent = Math.floor((Date.now() - procStart) / 1000) + 's';
+            }, 1000);
 
             const formData = new FormData();
             formData.append('file', selectedFile);
             formData.append('model', 'whisper-1');
             formData.append('response_format', 'verbose_json');
             formData.append('diarize', 'true');
+            formData.append('asr_backend', asrBackend);
+            formData.append('job_id', jobId);
             if (device) formData.append('device', device);
             if (numSpeakers) formData.append('num_speakers', numSpeakers);
             if (language) formData.append('language', language);
 
+            const headers = {};
+            headers['Authorization'] = 'Bearer ' + apiKey;
+
+            startProgressPolling(jobId);
+
             try {
-                const headers = {};
-                if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-
-                const res = await fetch('/v1/audio/transcriptions', {
-                    method: 'POST',
-                    headers: headers,
-                    body: formData
-                });
-
-                if (!res.ok) {
-                    const err = await res.json().catch(() => ({ detail: res.statusText }));
-                    throw new Error(err.detail?.error?.message || err.detail || 'HTTP Error ' + res.status);
-                }
-
-                const data = await res.json();
+                const data = await transcribeWithProgress(formData, headers);
                 lastResponseData = data;
                 speakerNameMap = {};
                 activeSpeakerFilter = 'ALL';
                 renderTranscript();
+                renderSummary(data);
+                showToast('Transcription complete: ' + (data.segments || []).length + ' speaker turns.', 'success');
 
             } catch (err) {
-                alert('Transcription Failed: ' + err.message);
-                emptyState.classList.remove('hidden');
+                stopProgressPolling();
+                if (String(err.message).includes('Unauthorized')) {
+                    localStorage.removeItem('strix_api_key');
+                    showGate('Your session was rejected — the API key may have changed. Enter it again to unlock.');
+                } else {
+                    showToast('Transcription failed: ' + err.message);
+                    emptyState.classList.remove('hidden');
+                }
             } finally {
+                clearInterval(elapsedInterval);
+                stopProgressPolling();
                 loadingState.classList.add('hidden');
                 processBtn.disabled = false;
             }
         });
+
+        function renderSummary(data) {
+            const segs = data.segments || [];
+            if (!segs.length) return;
+            const speakers = new Set(segs.map(s => s.speaker || 'SPEAKER_00')).size;
+            const duration = Math.max(...segs.map(s => s.end || 0));
+            const latencies = segs.map(s => s.npu_latency_ms).filter(v => typeof v === 'number' && v > 0);
+            const avg = latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : null;
+
+            statSpeakers.textContent = speakers;
+            statTurns.textContent = segs.length;
+            statDuration.textContent = duration >= 60
+                ? Math.floor(duration / 60) + 'm ' + Math.round(duration % 60) + 's'
+                : Math.round(duration) + 's';
+            statLatency.textContent = avg !== null ? avg + 'ms' : '–';
+
+            summaryStrip.classList.remove('hidden');
+        }
 
         function formatTime(sec) {
             const m = Math.floor(sec / 60);
@@ -537,13 +985,37 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         }
 
         window.renameSpeaker = function(rawSpeaker) {
-            const current = getDisplayName(rawSpeaker);
-            const newName = prompt(`Rename '${current}' to:`, current);
-            if (newName && newName.trim()) {
-                speakerNameMap[rawSpeaker] = newName.trim();
-                renderTranscript();
-            }
+            renameTarget = rawSpeaker;
+            renameRawLabel.textContent = rawSpeaker;
+            renameInput.value = getDisplayName(rawSpeaker);
+            renameModal.classList.remove('hidden');
+            renameInput.focus();
+            renameInput.select();
         };
+
+        function closeRenameModal() {
+            renameModal.classList.add('hidden');
+            renameTarget = null;
+        }
+
+        renameCancelBtn.addEventListener('click', closeRenameModal);
+        renameModal.addEventListener('click', (e) => { if (e.target === renameModal) closeRenameModal(); });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !renameModal.classList.contains('hidden')) closeRenameModal();
+        });
+        renameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') renameSaveBtn.click();
+        });
+
+        renameSaveBtn.addEventListener('click', () => {
+            const newName = renameInput.value.trim();
+            if (newName && renameTarget) {
+                speakerNameMap[renameTarget] = newName;
+                renderTranscript();
+                showToast('Speaker renamed to "' + newName + '".', 'success');
+            }
+            closeRenameModal();
+        });
 
         function renderFilterPills(speakers) {
             speakerFilterPills.innerHTML = '';
@@ -582,6 +1054,13 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 return matchesSpeaker && matchesSearch;
             });
 
+            if (searchQuery || activeSpeakerFilter !== 'ALL') {
+                matchCount.textContent = filtered.length + ' / ' + rawSegments.length + ' turns';
+                matchCount.classList.remove('hidden');
+            } else {
+                matchCount.classList.add('hidden');
+            }
+
             if (filtered.length === 0) {
                 transcriptFeed.innerHTML = '<div class="py-8 text-center text-xs text-slate-500">No matching speaker turns found.</div>';
             } else {
@@ -589,24 +1068,33 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     const card = document.createElement('div');
                     const [styleClass, textColor] = getSpeakerStyle(seg.speaker).split(' ');
                     const displayName = getDisplayName(seg.speaker);
-                    
-                    let highlightedText = seg.text;
+
+                    const safeText = escapeHtml(seg.text);
+                    let highlightedText = safeText;
                     if (searchQuery) {
-                        const regex = new RegExp(`(${searchQuery})`, 'gi');
-                        highlightedText = seg.text.replace(regex, '<mark class="bg-indigo-500/30 text-indigo-200 px-1 rounded">$1</mark>');
+                        const idx = seg.text.toLowerCase().indexOf(searchQuery);
+                        if (idx !== -1) {
+                            highlightedText = escapeHtml(seg.text.slice(0, idx)) +
+                                '<mark class="bg-indigo-500/30 text-indigo-200 px-1 rounded">' +
+                                escapeHtml(seg.text.slice(idx, idx + searchQuery.length)) + '</mark>' +
+                                escapeHtml(seg.text.slice(idx + searchQuery.length));
+                        }
                     }
 
                     card.className = `p-3.5 rounded-xl border-l-4 ${styleClass} border border-slate-800 transition`;
+                    card.dataset.start = seg.start;
+                    card.dataset.end = seg.end;
                     card.innerHTML = `
                         <div class="flex items-center justify-between mb-1">
                             <div class="flex items-center gap-2">
-                                <button onclick="renameSpeaker('${seg.speaker}')" title="Click to Rename Speaker" class="text-xs font-semibold uppercase tracking-wider ${textColor} hover:underline flex items-center gap-1.5 cursor-pointer">
-                                    <span>${displayName}</span>
+                                <button onclick="renameSpeaker('${escapeHtml(seg.speaker)}')" title="Click to Rename Speaker" class="text-xs font-semibold uppercase tracking-wider ${textColor} hover:underline flex items-center gap-1.5 cursor-pointer">
+                                    <span>${escapeHtml(displayName)}</span>
                                     <i class="fa-solid fa-pen text-[9px] opacity-60"></i>
                                 </button>
-                                <button onclick="seekAudio(${seg.start})" class="text-[11px] font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 cursor-pointer bg-slate-800/60 px-1.5 py-0.5 rounded">
+                                <button onclick="seekAudio(${Number(seg.start) || 0})" class="text-[11px] font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 cursor-pointer bg-slate-800/60 px-1.5 py-0.5 rounded">
                                     <i class="fa-solid fa-play text-[9px]"></i> ${formatTime(seg.start)} - ${formatTime(seg.end)}
                                 </button>
+                                ${seg.backend ? `<span class="text-[9px] font-mono px-1.5 py-0.5 rounded border ${String(seg.backend).includes('NPU') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-slate-800 text-slate-400 border-slate-700'}">${escapeHtml(seg.backend)}</span>` : ''}
                             </div>
                             ${seg.npu_latency_ms ? `<span class="text-[10px] text-slate-500">${seg.npu_latency_ms}ms NPU</span>` : ''}
                         </div>
@@ -630,22 +1118,67 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             }
         };
 
+        // Highlight + scroll to the segment currently playing
+        let activeSegCard = null;
+        audioPreview.addEventListener('timeupdate', () => {
+            if (!lastResponseData) return;
+            const t = audioPreview.currentTime;
+            const segs = lastResponseData.segments || [];
+            const active = segs.find(s => t >= s.start && t < s.end);
+            if (!active) return;
+            const card = Array.from(transcriptFeed.children).find(el => {
+                const s = parseFloat(el.dataset.start), e2 = parseFloat(el.dataset.end);
+                return !isNaN(s) && !isNaN(e2) && t >= s && t < e2;
+            });
+            if (card && card !== activeSegCard) {
+                if (activeSegCard) activeSegCard.classList.remove('seg-active');
+                activeSegCard = card;
+                card.classList.add('seg-active');
+                card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            }
+        });
+
+        function fmtStamp(sec, comma) {
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = Math.floor(sec % 60);
+            const ms = Math.round((sec - Math.floor(sec)) * 1000);
+            const base = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}${comma ? ',' : '.'}${String(ms).padStart(3,'0')}`;
+            return base;
+        }
+
         // Export Actions with Renamed Speakers
         copyBtn.addEventListener('click', () => {
             if (!lastResponseData) return;
             const text = (lastResponseData.segments || []).map(s => `[${formatTime(s.start)}] ${getDisplayName(s.speaker)}: ${s.text}`).join('\n');
             navigator.clipboard.writeText(text);
-            copyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Copied!';
-            setTimeout(() => copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i> Copy', 1500);
+            showToast('Transcript copied to clipboard.', 'success');
+        });
+
+        downloadTxtBtn.addEventListener('click', () => {
+            if (!lastResponseData) return;
+            const text = (lastResponseData.segments || []).map(s =>
+                `[${fmtStamp(s.start)} -> ${fmtStamp(s.end)}] ${getDisplayName(s.speaker)}: ${s.text}`
+            ).join('\n');
+            downloadFile(text, 'transcript.txt', 'text/plain');
         });
 
         downloadSrtBtn.addEventListener('click', () => {
             if (!lastResponseData) return;
             let srt = '';
             (lastResponseData.segments || []).forEach((s, idx) => {
-                srt += `${idx + 1}\n${formatTime(s.start).replace('.', ',')}0 --> ${formatTime(s.end).replace('.', ',')}0\n${getDisplayName(s.speaker)}: ${s.text}\n\n`;
+                srt += `${idx + 1}\n${fmtStamp(s.start, true)} --> ${fmtStamp(s.end, true)}\n${getDisplayName(s.speaker)}: ${s.text}\n\n`;
             });
             downloadFile(srt, 'transcript.srt', 'text/plain');
+        });
+
+        downloadVttBtn.addEventListener('click', () => {
+            if (!lastResponseData) return;
+            let vtt = 'WEBVTT\n\n';
+            (lastResponseData.segments || []).forEach((s) => {
+                vtt += `${fmtStamp(s.start)} --> ${fmtStamp(s.end)}\n<v ${getDisplayName(s.speaker)}>${s.text}\n\n`;
+            });
+            downloadFile(vtt, 'transcript.vtt', 'text/vtt');
         });
 
         downloadJsonBtn.addEventListener('click', () => {
@@ -734,6 +1267,16 @@ def list_models(_: bool = Depends(verify_api_key)):
     }
 
 
+@app.get("/v1/progress/{job_id}")
+def get_job_progress(job_id: str, _: bool = Depends(verify_api_key)):
+    """Poll live pipeline progress for a submitted job."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": {"message": "Unknown job id.", "code": "job_not_found"}}, status_code=404)
+    return JSONResponse(job)
+
+
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
     file: UploadFile = File(...),
@@ -747,6 +1290,8 @@ async def create_transcription(
     min_speakers: Optional[int] = Form(None),
     max_speakers: Optional[int] = Form(None),
     device: Optional[str] = Form(None),
+    asr_backend: str = Form("auto"),
+    job_id: Optional[str] = Form(None),
     _: bool = Depends(verify_api_key)
 ):
     """
@@ -760,6 +1305,25 @@ async def create_transcription(
 
     active_device = device or SERVER_CONFIG["default_device"]
 
+    def _progress_cb(p):
+        if job_id:
+            entry = dict(p)
+            entry["ts"] = time.time()
+            with JOBS_LOCK:
+                JOBS[job_id] = entry
+
+    if job_id:
+        now = time.time()
+        with JOBS_LOCK:
+            JOBS[job_id] = {"stage": "upload", "detail": "Received — queuing on server…", "pct": None, "ts": now}
+            # Expire jobs older than 10 minutes and keep at most 32 done entries
+            stale = [k for k, v in JOBS.items() if now - v.get("ts", 0) > 600]
+            for k in stale:
+                JOBS.pop(k, None)
+            done = [k for k, v in JOBS.items() if v.get("stage") == "done"]
+            for k in done[:-32]:
+                JOBS.pop(k, None)
+
     try:
         if diarize:
             results = await run_pipeline_blocking(
@@ -772,7 +1336,9 @@ async def create_transcription(
                 max_speakers=max_speakers,
                 lemonade_url=SERVER_CONFIG["lemonade_url"],
                 language=language,
-                padding_sec=0.15
+                padding_sec=0.15,
+                asr_backend=asr_backend,
+                progress_cb=_progress_cb
             )
 
             full_text = " ".join(r["text"].strip() for r in results if r.get("text"))
@@ -805,7 +1371,8 @@ async def create_transcription(
                         "avg_logprob": -0.1,
                         "compression_ratio": 1.0,
                         "no_speech_prob": 0.0,
-                        "npu_latency_ms": r.get("latency_ms", 0.0)
+                        "npu_latency_ms": r.get("latency_ms", 0.0),
+                        "backend": r.get("backend", "")
                     })
 
                 return JSONResponse({
@@ -830,7 +1397,8 @@ async def create_transcription(
                 lemonade_url=SERVER_CONFIG["lemonade_url"],
                 language=language,
                 prompt=prompt,
-                fallback_device=active_device
+                fallback_device=active_device,
+                asr_backend=asr_backend
             )
 
             if response_format == "text":
@@ -848,6 +1416,34 @@ async def create_transcription(
             else:
                 return JSONResponse({"text": text})
 
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        msg = str(e)
+        if "Could not decode" in msg or "unsupported format" in msg.lower():
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"message": msg, "type": "invalid_request_error", "code": "unsupported_audio_format"}},
+            )
+        raise HTTPException(
+            status_code=500, detail={"error": {"message": msg, "type": "server_error"}}
+        )
+    except Exception as e:
+        msg = str(e)
+        if "Format not recognised" in msg or "Error opening" in msg:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": {
+                        "message": f"Could not decode audio file — unsupported or corrupt format. Try WAV, MP3, or FLAC. ({msg})",
+                        "type": "invalid_request_error",
+                        "code": "unsupported_audio_format",
+                    }
+                },
+            )
+        raise HTTPException(
+            status_code=500, detail={"error": {"message": msg, "type": "server_error"}}
+        )
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -871,6 +1467,8 @@ def main():
         api_key = None
     else:
         api_key = args.api_key or os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if api_key and api_key.strip().lower() == "empty":
+            api_key = None  # vLLM-style sentinel meaning "no auth"
         if not api_key:
             api_key = f"sk-strix-{secrets.token_hex(16)}"
             print(yellow(f"\n[!] No API key specified. Generated auto key:\n    {bold(api_key)}\n"))

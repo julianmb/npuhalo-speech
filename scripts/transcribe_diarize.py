@@ -139,14 +139,19 @@ def transcribe_audio_segment(
     model_name: str = "whisper-v3-turbo-FLM",
     language: Optional[str] = None,
     prompt: Optional[str] = None,
-    fallback_device: str = "cpu"
+    fallback_device: str = "cpu",
+    asr_backend: str = "auto"
 ) -> Tuple[str, str]:
     """
     Transcribe audio segment with prompt conditioning.
-    Attempts NPU first via Lemonade; falls back to local CPU/GPU Faster-Whisper if NPU is offline.
+    asr_backend: 'auto' (NPU preferred, local fallback), 'npu' (no fallback),
+                 'cpu' / 'gpu' (local only).
     """
-    # 1. Try NPU via Lemonade
-    if check_npu_available(lemonade_url):
+    want_npu = asr_backend in ("auto", "npu")
+    want_local = asr_backend in ("auto", "cpu", "gpu")
+
+    # 1. NPU via Lemonade
+    if want_npu and check_npu_available(lemonade_url):
         try:
             with open(audio_path, "rb") as f:
                 files = {"file": (Path(audio_path).name, f, "audio/wav")}
@@ -161,12 +166,18 @@ def transcribe_audio_segment(
                     return res.json().get("text", "").strip(), "NPU (XDNA 2)"
         except Exception:
             pass
+        if asr_backend == "npu":
+            raise RuntimeError("NPU backend selected but transcription via Lemonade failed.")
 
     # 2. Local Fallback (CPU / GPU)
-    model = get_local_whisper_model(device=fallback_device, model_size="turbo")
+    if not want_local:
+        raise RuntimeError("NPU backend selected but Lemonade is unreachable.")
+
+    local_device = "cuda" if asr_backend == "gpu" else fallback_device
+    model = get_local_whisper_model(device=local_device, model_size="turbo")
     segments, _ = model.transcribe(audio_path, language=language, initial_prompt=prompt, beam_size=1)
     text = " ".join([seg.text.strip() for seg in segments]).strip()
-    backend_label = f"Local Whisper ({fallback_device.upper()})"
+    backend_label = f"Local Whisper ({local_device.upper()})"
     return text, backend_label
 
 
@@ -176,9 +187,10 @@ def transcribe_audio_npu(
     model_name: str = "whisper-v3-turbo-FLM",
     language: Optional[str] = None,
     prompt: Optional[str] = None,
-    fallback_device: str = "cpu"
+    fallback_device: str = "cpu",
+    asr_backend: str = "auto"
 ) -> str:
-    text, _ = transcribe_audio_segment(audio_path, lemonade_url, model_name, language, prompt, fallback_device)
+    text, _ = transcribe_audio_segment(audio_path, lemonade_url, model_name, language, prompt, fallback_device, asr_backend)
     return text
 
 
@@ -213,11 +225,8 @@ def run_pyannote_diarization(
             return run_fallback_diarization(audio_path, num_speakers=num_speakers)
         raise e
 
-    waveform, sample_rate = sf.read(audio_path)
-    if waveform.ndim == 1:
-        waveform = waveform[np.newaxis, :]
-    else:
-        waveform = waveform.T
+    y, sample_rate = librosa_or_sf_load(audio_path)
+    waveform = y[np.newaxis, :]
     
     audio_tensor = torch.from_numpy(waveform.astype(np.float32)).to(target_device)
     audio_input = {"waveform": audio_tensor, "sample_rate": sample_rate}
@@ -252,7 +261,7 @@ def run_fallback_diarization(audio_path: str, num_speakers: Optional[int] = 2) -
     import librosa
     from sklearn.cluster import KMeans
 
-    y, sr = librosa.load(audio_path, sr=16000)
+    y, sr = librosa_or_sf_load(audio_path)
     duration = len(y) / sr
     
     intervals = librosa.effects.split(y, top_db=25, frame_length=2048, hop_length=512)
@@ -313,18 +322,30 @@ def process_pipeline(
     max_speakers: Optional[int] = None,
     lemonade_url: str = "http://127.0.0.1:13305",
     language: Optional[str] = None,
-    padding_sec: float = 0.15
+    padding_sec: float = 0.15,
+    asr_backend: str = "auto",
+    progress_cb: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
     """
     Heterogeneous orchestration with 150ms acoustic padding & rolling prompt memory:
     1. Resample / load audio
     2. Speaker Diarization on CPU or GPU (Pyannote)
     3. Whisper transcription with boundary padding & context memory
+
+    progress_cb receives dicts: {"stage": load|diarize|transcribe|done, "detail": str, "pct": float|None}
     """
+    def _report(stage: str, detail: str = "", pct: Optional[float] = None):
+        if progress_cb:
+            try:
+                progress_cb({"stage": stage, "detail": detail, "pct": pct})
+            except Exception:
+                pass
+
     audio_file = Path(audio_path).resolve()
     if not audio_file.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
 
+    _report("load", "Loading and resampling audio…")
     active_device = resolve_torch_device(device)
     device_name = "CPU" if active_device == "cpu" else f"GPU ({active_device})"
 
@@ -346,6 +367,7 @@ def process_pipeline(
     print(f"  • Audio Duration:   {duration:.2f} seconds ({sr} Hz)")
 
     # 2. Run Speaker Diarization
+    _report("diarize", f"Running speaker diarization on {device_name}…")
     speaker_turns = run_pyannote_diarization(
         str(audio_file),
         hf_token=hf_token,
@@ -364,7 +386,9 @@ def process_pipeline(
     print(f"[+] Found {len(speaker_turns)} speaker speech turns.")
 
     # 3. Transcribe each turn with padding & prompt context memory
-    print(cyan("\n[*] Transcribing speaker turns with acoustic padding..."))
+    total_turns = len(speaker_turns)
+    print(cyan(f"\n[*] Transcribing {total_turns} speaker turns with acoustic padding..."))
+    _report("transcribe", f"Transcribing {total_turns} turns…", 0.0)
     results = []
     rolling_prompt = ""
     
@@ -374,6 +398,8 @@ def process_pipeline(
             seg_len = en - st
             if seg_len < 0.2:
                 continue
+
+            _report("transcribe", f"Turn {idx}/{total_turns} ({spk})…", round((idx - 1) / total_turns * 100, 1))
 
             # Apply 150ms acoustic padding at boundaries
             pad_start = max(0.0, st - padding_sec)
@@ -392,7 +418,8 @@ def process_pipeline(
                 lemonade_url=lemonade_url,
                 language=language,
                 prompt=rolling_prompt[-150:] if rolling_prompt else None,
-                fallback_device=active_device
+                fallback_device=active_device,
+                asr_backend=asr_backend
             )
             t_ms = (time.time() - t0) * 1000
 
@@ -408,11 +435,32 @@ def process_pipeline(
                 })
                 print(f"  [{format_timestamp(st)} -> {format_timestamp(en)}] {bold(spk)}: {text} {dim(f'({t_ms:.0f}ms {backend})')}")
 
+    _report("done", f"Completed {len(results)} turns", 100.0)
     return results
 
 
+def _av_load(path: str, target_sr: int = 16000):
+    """Decode any FFmpeg-supported audio (m4a, aac, wma, webm…) via PyAV."""
+    import av
+    container = av.open(path)
+    stream = container.streams.audio[0]
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=target_sr)
+    chunks = []
+    for frame in container.decode(audio=0):
+        for resampled in resampler.resample(frame):
+            arr = resampled.to_ndarray()
+            # av gives shape (channels, samples) — mono so take first row
+            if arr.ndim == 2:
+                arr = arr[0]
+            chunks.append(arr.astype(np.float32))
+    if not chunks:
+        return np.array([], dtype=np.float32), target_sr
+    return np.concatenate(chunks).astype(np.float32), target_sr
+
+
 def librosa_or_sf_load(path: str):
-    """Load audio, resample to 16kHz mono if necessary."""
+    """Load audio, resample to 16kHz mono. Handles wav/mp3/flac via soundfile, m4a/aac/webm via PyAV."""
+    # 1. Try soundfile (fast, no extra deps)
     try:
         data, sr = sf.read(path)
         if data.ndim > 1:
@@ -423,9 +471,25 @@ def librosa_or_sf_load(path: str):
             sr = 16000
         return data.astype(np.float32), sr
     except Exception:
+        pass
+
+    # 2. Try PyAV (handles m4a, aac, wma, webm/opus from mic recordings)
+    try:
+        return _av_load(path, target_sr=16000)
+    except Exception:
+        pass
+
+    # 3. Last resort: librosa (may use audioread/soundfile internally)
+    try:
         import librosa
         data, sr = librosa.load(path, sr=16000)
         return data.astype(np.float32), sr
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not decode audio file {Path(path).name!r} — "
+            f"unsupported format or missing codec ({e}). "
+            f"Try converting to WAV/MP3/FLAC."
+        ) from e
 
 
 def output_transcript(results: List[Dict[str, Any]], out_format: str = "text", output_file: Optional[str] = None):
@@ -492,6 +556,8 @@ def main():
     parser.add_argument("--min-speakers", type=int, default=None, help="Minimum number of speakers (if exact count unknown)")
     parser.add_argument("--max-speakers", type=int, default=None, help="Maximum number of speakers (if exact count unknown)")
     parser.add_argument("--language", type=str, default=None, help="Language code (e.g. 'en', 'es', 'zh')")
+    parser.add_argument("--asr-backend", choices=["auto", "npu", "cpu", "gpu"], default="auto",
+                        help="Transcription engine: auto (NPU preferred), npu (no fallback), cpu, gpu")
     parser.add_argument("--format", choices=["text", "json", "srt", "vtt"], default="text", help="Output format")
     parser.add_argument("--output", "-o", type=str, default=None, help="Save transcript to output file (single file mode)")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for batch processing")
@@ -533,7 +599,8 @@ def main():
                     min_speakers=args.min_speakers,
                     max_speakers=args.max_speakers,
                     lemonade_url=args.lemonade_url,
-                    language=args.language
+                    language=args.language,
+                    asr_backend=args.asr_backend
                 )
                 output_transcript(results, out_format=args.format, output_file=str(out_file))
             except Exception as e:
@@ -553,7 +620,8 @@ def main():
                 min_speakers=args.min_speakers,
                 max_speakers=args.max_speakers,
                 lemonade_url=args.lemonade_url,
-                language=args.language
+                language=args.language,
+                asr_backend=args.asr_backend
             )
             print("\n" + "=" * 78)
             print(bold(" 📝 FINAL SPEAKER-ATTRIBUTED TRANSCRIPT"))
