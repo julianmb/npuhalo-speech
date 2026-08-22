@@ -239,7 +239,14 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                             <option value="gpu">Local GPU (ROCm/CUDA)</option>
                         </select>
                     </div>
+                </div>
 
+                <button id="advancedToggle" class="w-full flex items-center justify-between text-xs text-slate-400 hover:text-slate-200 py-1 transition">
+                    <span class="flex items-center gap-1.5"><i id="advIcon" class="fa-solid fa-chevron-right text-[10px] transition-transform"></i> Advanced</span>
+                    <span class="text-[10px] text-slate-600">language · speaker count</span>
+                </button>
+
+                <div id="advancedPanel" class="hidden grid grid-cols-2 gap-4">
                     <div>
                         <label class="block text-xs font-medium text-slate-300 mb-1">Num Speakers</label>
                         <input type="number" id="numSpeakersInput" placeholder="Auto" min="1" max="20"
@@ -308,12 +315,23 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     <div class="relative flex-1">
                         <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-500 text-xs"></i>
                         <input type="text" id="searchInput" placeholder="Search transcript text..."
-                               class="w-full bg-slate-800/70 border border-slate-700 text-xs rounded-lg pl-8 pr-3 py-2 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                               class="w-full bg-slate-800/70 border border-slate-700 text-xs rounded-lg pl-8 pr-12 py-2 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                        <div id="searchNav" class="hidden absolute right-1 top-1 bottom-1 flex items-center gap-0.5">
+                            <button id="searchPrevBtn" aria-label="Previous match" class="w-6 h-6 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700 flex items-center justify-center"><i class="fa-solid fa-chevron-up text-[10px]"></i></button>
+                            <button id="searchNextBtn" aria-label="Next match" class="w-6 h-6 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700 flex items-center justify-center"><i class="fa-solid fa-chevron-down text-[10px]"></i></button>
+                        </div>
                     </div>
                     <span id="matchCount" class="hidden text-[10px] font-mono text-slate-500 whitespace-nowrap"></span>
                     <div id="speakerFilterPills" class="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
                         <!-- Speaker filter pills rendered dynamically -->
                     </div>
+                </div>
+
+                <!-- Error Banner (shown on failure with retry) -->
+                <div id="errorBanner" class="hidden shrink-0 flex items-center gap-3 px-4 py-3 bg-rose-950/40 border border-rose-500/30 rounded-xl text-xs text-rose-200">
+                    <i class="fa-solid fa-circle-exclamation"></i>
+                    <span id="errorMsg" class="flex-1 leading-relaxed"></span>
+                    <button id="retryBtn" class="shrink-0 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs transition">Retry</button>
                 </div>
 
                 <!-- Empty State -->
@@ -508,6 +526,23 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         const recentList = document.getElementById('recentList');
         const recentItems = document.getElementById('recentItems');
         const clearHistoryBtn = document.getElementById('clearHistoryBtn');
+        const errorBanner = document.getElementById('errorBanner');
+        const errorMsg = document.getElementById('errorMsg');
+        const retryBtn = document.getElementById('retryBtn');
+
+        function showError(msg) {
+            errorMsg.textContent = msg;
+            errorBanner.classList.remove('hidden');
+            emptyState.classList.remove('hidden');
+            showToast(msg, 'error');
+        }
+        function hideError() {
+            errorBanner.classList.add('hidden');
+        }
+        retryBtn.addEventListener('click', () => {
+            hideError();
+            if (selectedFile) processBtn.click();
+        });
         const renameModal = document.getElementById('renameModal');
         const renameRawLabel = document.getElementById('renameRawLabel');
         const renameInput = document.getElementById('renameInput');
@@ -737,6 +772,17 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 }
             }
         });
+
+        // Advanced settings toggle
+        const advToggle = document.getElementById('advancedToggle');
+        const advPanel = document.getElementById('advancedPanel');
+        const advIcon = document.getElementById('advIcon');
+        if (advToggle) {
+            advToggle.addEventListener('click', () => {
+                advPanel.classList.toggle('hidden');
+                advIcon.classList.toggle('rotate-90');
+            });
+        }
 
         // File Selection Handlers
         dropZone.addEventListener('click', () => fileInput.click());
@@ -986,6 +1032,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             let jobId;
             try { jobId = crypto.randomUUID(); } catch { jobId = 'job-' + Date.now() + '-' + Math.random().toString(36).slice(2); }
 
+            hideError();
             emptyState.classList.add('hidden');
             transcriptFeed.classList.add('hidden');
             exportGroup.classList.add('hidden');
@@ -1044,8 +1091,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     recoverJob(jobId);
                 } else {
                     stopProgressPolling();
-                    showToast('Transcription failed: ' + err.message);
-                    emptyState.classList.remove('hidden');
+                    showError('Transcription failed: ' + err.message);
                 }
             } finally {
                 clearInterval(elapsedInterval);
@@ -1080,16 +1126,14 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                     } else if (Date.now() - startedAt > 20 * 60 * 1000) {
                         clearInterval(recoverTimer);
                         loadingState.classList.add('hidden');
-                        emptyState.classList.remove('hidden');
-                        showToast('Gave up waiting for the result after 20 minutes.', 'error');
+                        showError('Gave up waiting for the result after 20 minutes.');
                     }
                 } catch {
                     misses++;
                     if (misses > 8) {
                         clearInterval(recoverTimer);
                         loadingState.classList.add('hidden');
-                        emptyState.classList.remove('hidden');
-                        showToast('Lost contact with the server. If it finishes the job, check Recent transcripts later.', 'error');
+                        showError('Lost contact with the server. If it finishes the job, check Recent transcripts later.');
                     }
                 }
             }, 3000);
@@ -1191,6 +1235,18 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             });
         }
 
+        let currentMatchIdx = 0;
+        let matchElements = [];
+
+        function scrollToMatch(idx) {
+            if (!matchElements.length) return;
+            currentMatchIdx = (idx + matchElements.length) % matchElements.length;
+            const el = matchElements[currentMatchIdx];
+            el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            el.classList.add('ring-1', 'ring-indigo-500');
+            setTimeout(() => el.classList.remove('ring-1', 'ring-indigo-500'), 1200);
+        }
+
         function renderTranscript() {
             if (!lastResponseData) return;
             const rawSegments = lastResponseData.segments || [];
@@ -1200,31 +1256,45 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             renderFilterPills(allSpeakers);
 
             const searchQuery = searchInput.value.toLowerCase().trim();
+            const searchActive = !!searchQuery;
 
-            const filtered = rawSegments.filter(seg => {
-                const matchesSpeaker = (activeSpeakerFilter === 'ALL') || (seg.speaker === activeSpeakerFilter);
-                const matchesSearch = !searchQuery || seg.text.toLowerCase().includes(searchQuery) || getDisplayName(seg.speaker).toLowerCase().includes(searchQuery);
-                return matchesSpeaker && matchesSearch;
-            });
+            // Speaker filter is exclusive (hides), search is inclusive (dims)
+            const visibleBySpeaker = rawSegments.filter(seg => (activeSpeakerFilter === 'ALL') || (seg.speaker === activeSpeakerFilter));
 
-            if (searchQuery || activeSpeakerFilter !== 'ALL') {
-                matchCount.textContent = filtered.length + ' / ' + rawSegments.length + ' turns';
+            if (searchActive || activeSpeakerFilter !== 'ALL') {
+                const matches = visibleBySpeaker.filter(seg =>
+                    seg.text.toLowerCase().includes(searchQuery) || getDisplayName(seg.speaker).toLowerCase().includes(searchQuery)
+                ).length;
+                if (searchActive) {
+                    matchCount.textContent = matches + ' / ' + visibleBySpeaker.length + ' matches';
+                    document.getElementById('searchNav').classList.toggle('hidden', matches === 0);
+                } else {
+                    matchCount.textContent = visibleBySpeaker.length + ' / ' + rawSegments.length + ' turns';
+                    document.getElementById('searchNav').classList.add('hidden');
+                }
                 matchCount.classList.remove('hidden');
             } else {
                 matchCount.classList.add('hidden');
+                document.getElementById('searchNav').classList.add('hidden');
             }
 
-            if (filtered.length === 0) {
+            if (visibleBySpeaker.length === 0) {
                 transcriptFeed.innerHTML = '<div class="py-8 text-center text-xs text-slate-500">No matching speaker turns found.</div>';
+                matchElements = [];
             } else {
-                filtered.forEach((seg) => {
+                const frag = document.createDocumentFragment();
+                let hadAnyMatch = false;
+                visibleBySpeaker.forEach((seg) => {
+                    const matchesSearch = !searchActive || seg.text.toLowerCase().includes(searchQuery) || getDisplayName(seg.speaker).toLowerCase().includes(searchQuery);
+                    if (searchActive && matchesSearch) hadAnyMatch = true;
+
                     const card = document.createElement('div');
                     const [styleClass, textColor] = getSpeakerStyle(seg.speaker).split(' ');
                     const displayName = getDisplayName(seg.speaker);
 
                     const safeText = escapeHtml(seg.text);
                     let highlightedText = safeText;
-                    if (searchQuery) {
+                    if (searchActive) {
                         const idx = seg.text.toLowerCase().indexOf(searchQuery);
                         if (idx !== -1) {
                             highlightedText = escapeHtml(seg.text.slice(0, idx)) +
@@ -1234,7 +1304,9 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                         }
                     }
 
-                    card.className = `p-3.5 rounded-xl border-l-4 ${styleClass} border border-slate-800 transition`;
+                    const dimClass = (searchActive && !matchesSearch) ? ' opacity-40' : '';
+                    if (searchActive && matchesSearch) card.dataset.isMatch = '1';
+                    card.className = `p-3.5 rounded-xl border-l-4 ${styleClass} border border-slate-800 transition${dimClass}`;
                     card.dataset.start = seg.start;
                     card.dataset.end = seg.end;
                     card.innerHTML = `
@@ -1253,8 +1325,12 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                         </div>
                         <p class="text-xs text-slate-200 leading-relaxed break-words">${highlightedText}</p>
                     `;
-                    transcriptFeed.appendChild(card);
+                    frag.appendChild(card);
                 });
+                transcriptFeed.appendChild(frag);
+                // Collect match elements for nav
+                matchElements = Array.from(transcriptFeed.querySelectorAll('[data-is-match="1"]'));
+                currentMatchIdx = 0;
             }
 
             transcriptFeed.classList.remove('hidden');
@@ -1263,6 +1339,15 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         }
 
         searchInput.addEventListener('input', () => renderTranscript());
+        document.getElementById('searchNextBtn').addEventListener('click', () => scrollToMatch(currentMatchIdx + 1));
+        document.getElementById('searchPrevBtn').addEventListener('click', () => scrollToMatch(currentMatchIdx - 1));
+        searchInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (e.shiftKey) scrollToMatch(currentMatchIdx - 1);
+                else scrollToMatch(currentMatchIdx + 1);
+            }
+        });
 
         window.seekAudio = function(seconds) {
             if (audioPreview && audioPreview.src) {
