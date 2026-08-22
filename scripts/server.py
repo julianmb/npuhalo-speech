@@ -1017,6 +1017,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 
             const headers = {};
             headers['Authorization'] = 'Bearer ' + apiKey;
+            let recovering = false;
 
             startProgressPolling(jobId);
 
@@ -1031,21 +1032,68 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 showToast('Transcription complete: ' + (data.segments || []).length + ' speaker turns.', 'success');
 
             } catch (err) {
-                stopProgressPolling();
                 if (String(err.message).includes('Unauthorized')) {
+                    stopProgressPolling();
                     localStorage.removeItem('strix_api_key');
                     showGate('Your session was rejected — the API key may have changed. Enter it again to unlock.');
+                } else if (String(err.message).includes('Network error') && selectedFile) {
+                    // POST connection dropped, but the server may still be processing
+                    // (or already finished). Try to recover the result via polling.
+                    stopProgressPolling();
+                    recovering = true;
+                    recoverJob(jobId);
                 } else {
+                    stopProgressPolling();
                     showToast('Transcription failed: ' + err.message);
                     emptyState.classList.remove('hidden');
                 }
             } finally {
                 clearInterval(elapsedInterval);
-                stopProgressPolling();
-                loadingState.classList.add('hidden');
+                if (!recovering) loadingState.classList.add('hidden');
                 processBtn.disabled = false;
             }
         });
+
+        // Recover a job whose POST connection was lost mid-flight.
+        function recoverJob(jobId) {
+            loadingState.classList.remove('hidden');
+            showToast('Connection lost — the server keeps working. Waiting for the result…', 'info');
+            let misses = 0;
+            const startedAt = Date.now();
+            const recoverTimer = setInterval(async () => {
+                try {
+                    const res = await fetch('/v1/progress/' + jobId, { headers: { 'Authorization': 'Bearer ' + getApiKey() } });
+                    if (!res.ok) throw new Error('poll failed');
+                    misses = 0;
+                    const p = await res.json();
+                    applyProgress(p);
+                    if (p.stage === 'done' && p.result) {
+                        clearInterval(recoverTimer);
+                        lastResponseData = p.result;
+                        speakerNameMap = {};
+                        activeSpeakerFilter = 'ALL';
+                        renderTranscript();
+                        renderSummary(p.result);
+                        rememberTranscript(selectedFile ? selectedFile.name : 'recording', p.result);
+                        loadingState.classList.add('hidden');
+                        showToast('Recovered transcript after connection drop.', 'success');
+                    } else if (Date.now() - startedAt > 20 * 60 * 1000) {
+                        clearInterval(recoverTimer);
+                        loadingState.classList.add('hidden');
+                        emptyState.classList.remove('hidden');
+                        showToast('Gave up waiting for the result after 20 minutes.', 'error');
+                    }
+                } catch {
+                    misses++;
+                    if (misses > 8) {
+                        clearInterval(recoverTimer);
+                        loadingState.classList.add('hidden');
+                        emptyState.classList.remove('hidden');
+                        showToast('Lost contact with the server. If it finishes the job, check Recent transcripts later.', 'error');
+                    }
+                }
+            }, 3000);
+        }
 
         function renderSummary(data) {
             const segs = data.segments || [];
@@ -1425,6 +1473,16 @@ async def create_transcription(
             with JOBS_LOCK:
                 JOBS[job_id] = entry
 
+    def _stash_result(payload):
+        """Keep the final response under the job so a dropped client
+        connection can recover it via /v1/progress polling."""
+        if job_id:
+            with JOBS_LOCK:
+                entry = JOBS.get(job_id) or {}
+                entry.update({"stage": "done", "detail": "Completed", "pct": 100.0,
+                              "ts": time.time(), "result": payload})
+                JOBS[job_id] = entry
+
     if job_id:
         now = time.time()
         with JOBS_LOCK:
@@ -1488,20 +1546,24 @@ async def create_transcription(
                         "backend": r.get("backend", "")
                     })
 
-                return JSONResponse({
+                response_payload = {
                     "task": "transcribe",
                     "language": language or "en",
                     "duration": round(duration, 2),
                     "text": full_text,
                     "segments": segments
-                })
+                }
+                _stash_result(response_payload)
+                return JSONResponse(response_payload)
 
             else:  # standard json
-                return JSONResponse({
+                json_payload = {
                     "text": full_text,
                     "speakers_detected": len(set(r["speaker"] for r in results)),
                     "turns": results
-                })
+                }
+                _stash_result(json_payload)
+                return JSONResponse(json_payload)
 
         else:
             text, _ = await run_pipeline_blocking(
