@@ -65,17 +65,73 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F file=@meeting.wav -F model=whisper-1 -F diarize=true
 ```
 
-Extra form fields beyond the OpenAI spec: `diarize` (bool, default `true`), `num_speakers`, `min_speakers`, `max_speakers`, `device` (`cpu`/`rocm`/`cuda`/`auto`). Response formats: `json`, `verbose_json`, `text`, `srt`, `vtt`.
+Extra form fields beyond the OpenAI spec: `diarize` (bool, default `true`), `num_speakers`, `min_speakers`, `max_speakers`, `device` (`cpu`/`rocm`/`cuda`/`auto`), `asr_backend` (`auto`/`npu`/`cpu`/`gpu`), `job_id` (client id for progress polling). Response formats: `json`, `verbose_json`, `text`, `srt`, `vtt`.
+
+## API reference
+
+Interactive docs: `http://localhost:8300/docs` when the server is running.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/` | — | Web Studio (login gate, upload, progress stepper, transcript review) |
+| `GET` | `/health` | — | NPU/backend status (`npu_backend: connected` vs `unreachable`) |
+| `GET` | `/api` | — | Capability listing |
+| `GET` | `/v1/models` | Bearer | OpenAI-compatible model list |
+| `POST` | `/v1/audio/transcriptions` | Bearer | Transcription + diarization (see below) |
+| `GET` | `/v1/progress/{job_id}` | Bearer | Live job progress (`upload` → `diarize` → `transcribe` → `done`, plus `result` when finished) |
+
+`POST /v1/audio/transcriptions` form fields:
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `file` | file | — | WAV, MP3, M4A/AAC, FLAC, OGG/WebM |
+| `model` | string | `whisper-1` | Ignored except when forwarded to Lemonade |
+| `response_format` | `json`/`verbose_json`/`text`/`srt`/`vtt` | `json` | `verbose_json` is what the Studio uses |
+| `diarize` | bool | `true` | `false` = plain transcription |
+| `device` | `cpu`/`rocm`/`cuda`/`auto` | server default | Diarization device |
+| `asr_backend` | `auto`/`npu`/`cpu`/`gpu` | `auto` | `auto` prefers NPU then falls back |
+| `num_speakers`, `min_speakers`, `max_speakers` | int | auto | Speaker count hints |
+| `language`, `prompt`, `temperature` | — | — | Passed to Whisper |
+
+Poll progress while the POST is in flight:
+
+```bash
+# Client generates a job_id and polls it
+curl -X POST http://localhost:8300/v1/audio/transcriptions \
+  -H "Authorization: Bearer $API_KEY" \
+  -F file=@meeting.m4a -F job_id=my-job-123 -F diarize=true | jq .
+# meanwhile, in another shell:
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8300/v1/progress/my-job-123 | jq .
+```
+
+See `.env.example` for environment variables (`HF_TOKEN`, `API_KEY`, `LEMONADE_URL`).
 
 ## Development
 
 ```bash
-bash -n diarize.sh server.sh          # validate launchers
-python3 -m py_compile scripts/*.py    # syntax-check sources
-python3 -m unittest discover -s tests # unit tests (no torch/GPU needed)
+bash -n diarize.sh server.sh              # validate launchers
+python3 -m py_compile scripts/*.py        # syntax-check sources
+
+# Lint & format (ruff)
+pip install ruff
+ruff check scripts/ tests/
+ruff format --check scripts/ tests/
+
+# Type check (basedpyright, basic, non-blocking)
+pip install basedpyright
+basedpyright scripts/
+
+# Tests (no torch/GPU needed; 29 tests — pipeline + API routes)
+pip install httpx av soundfile
+python3 -m unittest discover -s tests -v
+# or: pytest tests/ -v
+
+# Full project install (dev + test extras)
+pip install -e ".[dev,test]"
 ```
 
-CI runs the same checks on every push and PR (see `.github/workflows/ci.yml`).
+See `CONTRIBUTING.md` for the full workflow and `CHANGELOG.md` for version history.
+CI runs all of the above on every push and PR (see `.github/workflows/ci.yml`).
 
 ## Hardware
 

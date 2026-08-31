@@ -10,36 +10,39 @@ Features:
 - 150ms acoustic boundary padding and rolling prompt continuity.
 """
 
+import argparse
 import os
-import time
 import secrets
 import tempfile
-import argparse
 import threading
+import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any
 
-from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException, Depends, status
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.concurrency import run_in_threadpool
 import uvicorn
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 # Import pipeline logic
 from transcribe_diarize import (
-    process_pipeline,
-    output_transcript,
-    transcribe_audio_segment,
+    bold,
+    cyan,
     ensure_npu_whisper,
-    librosa_or_sf_load,
     format_timestamp,
-    cyan, green, yellow, red, bold
+    green,
+    librosa_or_sf_load,
+    output_transcript,
+    process_pipeline,
+    transcribe_audio_segment,
+    yellow,
 )
 
 app = FastAPI(
     title="Strix Halo Speech & Diarization Server",
     description="OpenAI-compatible Audio API accelerated on AMD XDNA 2 NPU and Zen 5 CPU/GPU",
-    version="1.2.0"
+    version="1.2.0",
 )
 
 # Enable CORS for external client applications
@@ -55,26 +58,29 @@ SERVER_CONFIG = {
     "api_key": None,
     "lemonade_url": "http://127.0.0.1:13305",
     "default_device": "cpu",
-    "hf_token": None
+    "hf_token": None,
 }
 
 # Serialize heavy pipeline work to protect the NPU/GPU from concurrent thrashing
 PIPELINE_SEMAPHORE = threading.Semaphore(1)
 
 # Live job progress for client polling: {job_id: {"stage": ..., "detail": ..., "pct": ...}}
-JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
 
 def run_pipeline_blocking(fn, *args, **kwargs):
     """Run a pipeline function in the threadpool, gated by PIPELINE_SEMAPHORE."""
+
     def _worker():
         with PIPELINE_SEMAPHORE:
             return fn(*args, **kwargs)
+
     return run_in_threadpool(_worker)
 
 
-def verify_api_key(authorization: Optional[str] = Header(None)):
+def verify_api_key(authorization: str | None = Header(None)):
     """Enforce Bearer token authentication if API key is configured."""
     expected_key = SERVER_CONFIG["api_key"]
     if not expected_key:
@@ -83,14 +89,26 @@ def verify_api_key(authorization: Optional[str] = Header(None)):
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": {"message": "Missing Authorization header.", "type": "invalid_request_error", "code": "missing_api_key"}}
+            detail={
+                "error": {
+                    "message": "Missing Authorization header.",
+                    "type": "invalid_request_error",
+                    "code": "missing_api_key",
+                }
+            },
         )
 
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not secrets.compare_digest(token.strip(), expected_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": {"message": "Invalid API key provided.", "type": "invalid_request_error", "code": "invalid_api_key"}}
+            detail={
+                "error": {
+                    "message": "Invalid API key provided.",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
         )
     return True
 
@@ -1550,12 +1568,12 @@ def api_info():
             "transcription": "/v1/audio/transcriptions",
             "models": "/v1/models",
             "health": "/health",
-            "docs": "/docs"
+            "docs": "/docs",
         },
         "hardware": {
             "asr_engine": "OpenAI Whisper-v3-turbo on AMD XDNA 2 NPU (/dev/accel/accel0)",
-            "diarization_engine": f"Pyannote Audio on {SERVER_CONFIG['default_device'].upper()}"
-        }
+            "diarization_engine": f"Pyannote Audio on {SERVER_CONFIG['default_device'].upper()}",
+        },
     }
 
 
@@ -1566,7 +1584,7 @@ def health_check():
         "status": "ok" if npu_ok else "warning",
         "npu_backend": "connected" if npu_ok else "unreachable",
         "lemonade_url": SERVER_CONFIG["lemonade_url"],
-        "default_device": SERVER_CONFIG["default_device"]
+        "default_device": SERVER_CONFIG["default_device"],
     }
 
 
@@ -1579,21 +1597,21 @@ def list_models(_: bool = Depends(verify_api_key)):
                 "id": "whisper-1",
                 "object": "model",
                 "created": 1700000000,
-                "owned_by": "strix-halo-npu"
+                "owned_by": "strix-halo-npu",
             },
             {
                 "id": "whisper-v3-turbo",
                 "object": "model",
                 "created": 1700000000,
-                "owned_by": "strix-halo-npu"
+                "owned_by": "strix-halo-npu",
             },
             {
                 "id": "whisper-v3-turbo-FLM",
                 "object": "model",
                 "created": 1700000000,
-                "owned_by": "amd-xdna2"
-            }
-        ]
+                "owned_by": "amd-xdna2",
+            },
+        ],
     }
 
 
@@ -1603,7 +1621,9 @@ def get_job_progress(job_id: str, _: bool = Depends(verify_api_key)):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
-        return JSONResponse({"error": {"message": "Unknown job id.", "code": "job_not_found"}}, status_code=404)
+        return JSONResponse(
+            {"error": {"message": "Unknown job id.", "code": "job_not_found"}}, status_code=404
+        )
     return JSONResponse(job)
 
 
@@ -1611,23 +1631,22 @@ def get_job_progress(job_id: str, _: bool = Depends(verify_api_key)):
 async def create_transcription(
     file: UploadFile = File(...),
     model: str = Form("whisper-1"),
-    language: Optional[str] = Form(None),
-    prompt: Optional[str] = Form(None),
+    language: str | None = Form(None),
+    prompt: str | None = Form(None),
     response_format: str = Form("json"),
-    temperature: Optional[float] = Form(0.0),
+    temperature: float | None = Form(0.0),
     diarize: bool = Form(True),
-    num_speakers: Optional[int] = Form(None),
-    min_speakers: Optional[int] = Form(None),
-    max_speakers: Optional[int] = Form(None),
-    device: Optional[str] = Form(None),
+    num_speakers: int | None = Form(None),
+    min_speakers: int | None = Form(None),
+    max_speakers: int | None = Form(None),
+    device: str | None = Form(None),
     asr_backend: str = Form("auto"),
-    job_id: Optional[str] = Form(None),
-    _: bool = Depends(verify_api_key)
+    job_id: str | None = Form(None),
+    _: bool = Depends(verify_api_key),
 ):
     """
     OpenAI-compatible speech transcription & speaker diarization endpoint.
     """
-    MAX_UPLOAD_BYTES = 500 * 1024 * 1024
     file_suffix = Path(file.filename).suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
         tmp_path = tmp.name
@@ -1637,7 +1656,13 @@ async def create_transcription(
                 os.remove(tmp_path)
             raise HTTPException(
                 status_code=413,
-                detail={"error": {"message": f"File too large ({len(content) / (1024*1024):.0f} MB) — limit is 500 MB.", "type": "invalid_request_error", "code": "file_too_large"}},
+                detail={
+                    "error": {
+                        "message": f"File too large ({len(content) / (1024 * 1024):.0f} MB) — limit is 500 MB.",
+                        "type": "invalid_request_error",
+                        "code": "file_too_large",
+                    }
+                },
             )
         tmp.write(content)
 
@@ -1656,14 +1681,26 @@ async def create_transcription(
         if job_id:
             with JOBS_LOCK:
                 entry = JOBS.get(job_id) or {}
-                entry.update({"stage": "done", "detail": "Completed", "pct": 100.0,
-                              "ts": time.time(), "result": payload})
+                entry.update(
+                    {
+                        "stage": "done",
+                        "detail": "Completed",
+                        "pct": 100.0,
+                        "ts": time.time(),
+                        "result": payload,
+                    }
+                )
                 JOBS[job_id] = entry
 
     if job_id:
         now = time.time()
         with JOBS_LOCK:
-            JOBS[job_id] = {"stage": "upload", "detail": "Received — queuing on server…", "pct": None, "ts": now}
+            JOBS[job_id] = {
+                "stage": "upload",
+                "detail": "Received — queuing on server…",
+                "pct": None,
+                "ts": now,
+            }
             # Expire jobs older than 10 minutes and keep at most 32 done entries
             stale = [k for k, v in JOBS.items() if now - v.get("ts", 0) > 600]
             for k in stale:
@@ -1686,13 +1723,16 @@ async def create_transcription(
                 language=language,
                 padding_sec=0.15,
                 asr_backend=asr_backend,
-                progress_cb=_progress_cb
+                progress_cb=_progress_cb,
             )
 
             full_text = " ".join(r["text"].strip() for r in results if r.get("text"))
-            
+
             if response_format == "text":
-                formatted_text = "\n".join(f"[{format_timestamp(r['start'])} -> {format_timestamp(r['end'])}] {r['speaker']}: {r['text']}" for r in results)
+                formatted_text = "\n".join(
+                    f"[{format_timestamp(r['start'])} -> {format_timestamp(r['end'])}] {r['speaker']}: {r['text']}"
+                    for r in results
+                )
                 return PlainTextResponse(formatted_text)
 
             elif response_format in ("srt", "vtt"):
@@ -1704,31 +1744,33 @@ async def create_transcription(
             elif response_format == "verbose_json":
                 y, sr = librosa_or_sf_load(tmp_path)
                 duration = len(y) / sr
-                
+
                 segments = []
                 for idx, r in enumerate(results):
-                    segments.append({
-                        "id": idx,
-                        "seek": int(r["start"] * 100),
-                        "start": r["start"],
-                        "end": r["end"],
-                        "text": r["text"],
-                        "speaker": r["speaker"],
-                        "tokens": [],
-                        "temperature": temperature or 0.0,
-                        "avg_logprob": None,
-                        "compression_ratio": None,
-                        "no_speech_prob": None,
-                        "npu_latency_ms": r.get("latency_ms", 0.0),
-                        "backend": r.get("backend", "")
-                    })
+                    segments.append(
+                        {
+                            "id": idx,
+                            "seek": int(r["start"] * 100),
+                            "start": r["start"],
+                            "end": r["end"],
+                            "text": r["text"],
+                            "speaker": r["speaker"],
+                            "tokens": [],
+                            "temperature": temperature or 0.0,
+                            "avg_logprob": None,
+                            "compression_ratio": None,
+                            "no_speech_prob": None,
+                            "npu_latency_ms": r.get("latency_ms", 0.0),
+                            "backend": r.get("backend", ""),
+                        }
+                    )
 
                 response_payload = {
                     "task": "transcribe",
                     "language": language or "en",
                     "duration": round(duration, 2),
                     "text": full_text,
-                    "segments": segments
+                    "segments": segments,
                 }
                 _stash_result(response_payload)
                 return JSONResponse(response_payload)
@@ -1737,7 +1779,7 @@ async def create_transcription(
                 json_payload = {
                     "text": full_text,
                     "speakers_detected": len(set(r["speaker"] for r in results)),
-                    "turns": results
+                    "turns": results,
                 }
                 _stash_result(json_payload)
                 return JSONResponse(json_payload)
@@ -1750,7 +1792,7 @@ async def create_transcription(
                 language=language,
                 prompt=prompt,
                 fallback_device=active_device,
-                asr_backend=asr_backend
+                asr_backend=asr_backend,
             )
 
             if response_format == "text":
@@ -1758,13 +1800,17 @@ async def create_transcription(
             elif response_format == "verbose_json":
                 y, sr = librosa_or_sf_load(tmp_path)
                 duration = len(y) / sr
-                return JSONResponse({
-                    "task": "transcribe",
-                    "language": language or "en",
-                    "duration": round(duration, 2),
-                    "text": text,
-                    "segments": [{"id": 0, "start": 0.0, "end": round(duration, 2), "text": text}]
-                })
+                return JSONResponse(
+                    {
+                        "task": "transcribe",
+                        "language": language or "en",
+                        "duration": round(duration, 2),
+                        "text": text,
+                        "segments": [
+                            {"id": 0, "start": 0.0, "end": round(duration, 2), "text": text}
+                        ],
+                    }
+                )
             else:
                 return JSONResponse({"text": text})
 
@@ -1775,7 +1821,13 @@ async def create_transcription(
         if "Could not decode" in msg or "unsupported format" in msg.lower():
             raise HTTPException(
                 status_code=422,
-                detail={"error": {"message": msg, "type": "invalid_request_error", "code": "unsupported_audio_format"}},
+                detail={
+                    "error": {
+                        "message": msg,
+                        "type": "invalid_request_error",
+                        "code": "unsupported_audio_format",
+                    }
+                },
             )
         raise HTTPException(
             status_code=500, detail={"error": {"message": msg, "type": "server_error"}}
@@ -1805,13 +1857,36 @@ def main():
     parser = argparse.ArgumentParser(
         description="Strix Halo OpenAI-Compatible Speech & Diarization Server"
     )
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address to bind (default: 0.0.0.0)")
-    parser.add_argument("--port", "-p", type=int, default=8000, help="Port to listen on (default: 8000)")
-    parser.add_argument("--api-key", "-k", type=str, default=None, help="API key for Bearer authentication (default: env API_KEY or auto-generated)")
+    parser.add_argument(
+        "--host", type=str, default="0.0.0.0", help="Host address to bind (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port", "-p", type=int, default=8000, help="Port to listen on (default: 8000)"
+    )
+    parser.add_argument(
+        "--api-key",
+        "-k",
+        type=str,
+        default=None,
+        help="API key for Bearer authentication (default: env API_KEY or auto-generated)",
+    )
     parser.add_argument("--no-auth", action="store_true", help="Disable API key authentication")
-    parser.add_argument("--device", "-d", choices=["cpu", "cuda", "rocm", "auto"], default="cpu", help="Default diarization device (default: cpu)")
-    parser.add_argument("--lemonade-url", type=str, default=os.environ.get("LEMONADE_URL", "http://127.0.0.1:13305"), help="Lemonade NPU API URL")
-    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face token for gated pyannote model")
+    parser.add_argument(
+        "--device",
+        "-d",
+        choices=["cpu", "cuda", "rocm", "auto"],
+        default="cpu",
+        help="Default diarization device (default: cpu)",
+    )
+    parser.add_argument(
+        "--lemonade-url",
+        type=str,
+        default=os.environ.get("LEMONADE_URL", "http://127.0.0.1:13305"),
+        help="Lemonade NPU API URL",
+    )
+    parser.add_argument(
+        "--hf-token", type=str, default=None, help="Hugging Face token for gated pyannote model"
+    )
 
     args = parser.parse_args()
 
@@ -1834,10 +1909,14 @@ def main():
     print(bold(" 🚀 STRIX HALO OPENAI-COMPATIBLE SPEECH SERVER + WEB STUDIO"))
     print("=" * 78)
     print(f"  • Web UI Studio:     {cyan(f'http://{args.host}:{args.port}/')}")
-    print(f"  • API Key Required:  {green('Yes (Bearer Auth)') if api_key else yellow('Disabled (--no-auth)')}")
+    print(
+        f"  • API Key Required:  {green('Yes (Bearer Auth)') if api_key else yellow('Disabled (--no-auth)')}"
+    )
     if api_key:
         print(f"  • API Key:           {bold(api_key)}")
-    print(f"  • ASR Model:         {green('Whisper-v3-turbo')} on AMD XDNA 2 NPU (/dev/accel/accel0)")
+    print(
+        f"  • ASR Model:         {green('Whisper-v3-turbo')} on AMD XDNA 2 NPU (/dev/accel/accel0)"
+    )
     print(f"  • Diarization:       {cyan('pyannote')} on {cyan(args.device.upper())}")
     print(f"  • Interactive Docs:  {cyan(f'http://{args.host}:{args.port}/docs')}")
     print("=" * 78 + "\n")

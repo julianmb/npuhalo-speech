@@ -11,14 +11,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Validate shell launchers
         run: bash -n diarize.sh server.sh
+
+      - name: Lint (ruff)
+        run: |
+          pip install ruff
+          ruff check scripts/ tests/
+
+      - name: Format check (ruff)
+        run: ruff format --check scripts/ tests/
+
+      - name: Type check (basedpyright, non-blocking)
+        continue-on-error: true
+        run: |
+          pip install basedpyright
+          basedpyright scripts/
 
       - name: Syntax-check Python sources
         run: python3 -m py_compile scripts/*.py tests/*.py
 
-      - name: Install light test dependencies
-        run: pip install "numpy" "soundfile>=0.12.1" "requests>=2.31.0" "av>=11.0.0"
+      - name: Install test dependencies
+        run: pip install "numpy" "soundfile>=0.12.1" "requests>=2.31.0" "av>=11.0.0" "fastapi>=0.110.0" "httpx>=0.27.0"
 
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v

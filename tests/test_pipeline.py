@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """Unit tests for pure pipeline helpers in transcribe_diarize.py (stdlib unittest only)."""
 
-import io
 import json
 import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import soundfile as sf  # noqa: E402
-
 import transcribe_diarize as td  # noqa: E402
 
 
@@ -132,9 +129,14 @@ class TestLibrosaOrSfLoad(unittest.TestCase):
 
     def test_resamples_non_16k_wav(self):
         import numpy as np
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "tone44k.wav"
-            sf.write(str(path), (0.1 * np.sin(2 * np.pi * 440 * np.arange(8820) / 44100)).astype("float32"), 44100)
+            sf.write(
+                str(path),
+                (0.1 * np.sin(2 * np.pi * 440 * np.arange(8820) / 44100)).astype("float32"),
+                44100,
+            )
             y, sr = td.librosa_or_sf_load(str(path))
             self.assertEqual(sr, 16000)
             self.assertGreater(len(y), 2000)
@@ -146,6 +148,7 @@ class TestAvLoadM4a(unittest.TestCase):
     def make_m4a(self, path):
         import av
         import numpy as np
+
         container = av.open(str(path), mode="w")
         stream = container.add_stream("aac", rate=16000)
         stream.layout = "mono"
